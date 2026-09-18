@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  nhentai-dl:
+    build: .
+    container_name: nhentai-dl
+    restart: unless-stopped
+    environment:
+      - DOWNLOAD_DIR=/downloads
+      - TZ=Asia/Jakarta
+      - WEB_GUI=true
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount the local project folder (optional, keeps list.txt & library.json in sync)
+      - .:/app
+
+      # Mount the download destination folder to the Media HDD (using a CIFS mount point on the host)
+      # If your docker host (Linux/Proxmox) already mounts the SMB share at /mnt/hdd-media, use this:
+      # - /mnt/hdd-media/Downloads:/downloads
+
+      # OR if you want Docker to mount the SMB share directly (uncomment the line below & remove the one above):
+      - media_downloads:/downloads
+
+# Direct SMB volume configuration in Docker (optional if the host hasn't mounted it yet)
+volumes:
+  media_downloads:
+    driver_opts:
+      type: cifs
+      # Adjust to your NAS IP and path
+      device: //192.168.18.225/homelab/hdd-media/Downloads
+      # Enter the NAS username and password if any (use guest if there's no password)
+      o: "username=guest,password=,uid=1000,gid=1000,vers=3.0"

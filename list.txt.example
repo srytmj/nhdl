@@ -1,0 +1,14 @@
+# CONTOH ISI FILE list.txt
+# Bapak bisa memasukkan link lengkap atau hanya berupa angka ID-nya saja.
+# File ini bisa menerima berbagai macam format secara bebas. Setiap 1 baris untuk 1 komik.
+
+# Contoh Format 1 (Link Penuh):
+https://nhentai.net/g/614675/
+https://nhentai.net/g/123456/
+
+# Contoh Format 2 (Hanya ID):
+367805
+412355
+
+# Catatan: Baris yang diawali dengan tanda pagar (#) seperti ini akan otomatis diabaikan.
+# Jangan lupa HAPUS tanda pagar (#) di depan angka/link jika ingin mendownloadnya!

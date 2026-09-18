@@ -1,0 +1,26 @@
+{
+  "name": "nhdl",
+  "version": "2.0.0",
+  "description": "High-performance modular downloader for NHentai with Standalone CLI and Svelte Web Daemon",
+  "main": "nhentai-dl.js",
+  "bin": {
+    "nhdl": "./cli/index.js",
+    "nhdl-server": "./server/index.js"
+  },
+  "scripts": {
+    "start": "node nhentai-dl.js",
+    "cli": "node cli/index.js",
+    "server": "node server/index.js",
+    "build:ui": "npm --prefix webui run build",
+    "dev:ui": "npm --prefix webui run dev"
+  },
+  "keywords": [
+    "downloader",
+    "cli",
+    "daemon",
+    "svelte",
+    "homelab"
+  ],
+  "author": "",
+  "license": "ISC"
+}

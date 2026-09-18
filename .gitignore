@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Build output
+webui/dist/
+
+# Runtime data / user-generated content (not source code)
+Download/
+*.log
+library.json
+list.txt
+list_status.txt
+config.json
+progress.json
+temp.html
+
+# Editor / tooling
+.claude/
