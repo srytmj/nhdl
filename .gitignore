@@ -14,5 +14,8 @@ config.json
 progress.json
 temp.html
 
+# Secrets — real password lives here, never in git
+.env
+
 # Editor / tooling
 .claude/

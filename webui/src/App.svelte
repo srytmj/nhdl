@@ -8,8 +8,17 @@
         Activity, FileDigit, Clock, Folder, FolderOpen,
         ArrowUp, RotateCcw, Check, X, HardDrive, Square, Moon,
         Library, Search, BookOpen, Pencil, Archive, PackageCheck,
-        ChevronRight, ChevronDown, ScrollText, Download, CheckSquare
+        ChevronRight, ChevronDown, ScrollText, Download, CheckSquare, LogOut
     } from 'lucide-svelte';
+
+    let authRequired = false;
+
+    async function logout() {
+        try {
+            await fetch('/api/logout', { method: 'POST' });
+        } catch (e) {}
+        window.location.reload();
+    }
 
     function focusOnMount(node) {
         node.focus();
@@ -332,6 +341,7 @@
             }
             if (data.downloadFormat) downloadFormat = data.downloadFormat;
             if (typeof data.autoContinueBatches === 'boolean') autoContinueBatches = data.autoContinueBatches;
+            if (typeof data.authRequired === 'boolean') authRequired = data.authRequired;
         } catch(e) {}
     }
 
@@ -709,6 +719,14 @@
                 <span class="text-[10px] bg-[#2a2a2a] px-1.5 py-0.5 rounded text-gray-400 font-bold uppercase">Change</span>
             </button>
 
+            {#if authRequired}
+                <button
+                    on:click={logout}
+                    class="p-1.5 text-gray-500 hover:text-white hover:bg-[#202020] rounded transition-colors"
+                    title="Log out">
+                    <LogOut size={15} />
+                </button>
+            {/if}
         </div>
     </header>
 

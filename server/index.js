@@ -2,17 +2,22 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
+const { loadEnvFile } = require('../core/env');
+const ROOT_DIR = path.resolve(__dirname, '..');
+loadEnvFile(ROOT_DIR);
+
 const DownloaderEngine = require('../core/engine');
 const { DEFAULT_ERROR_LOG, syncListTracker, updateListStatus, loadLibrary, rescanLibrary, renameLibraryEntry, compressLibraryEntry } = require('../core/tracker');
 const { extractGalleries } = require('../core/utils');
 const { logActivity, readActivityLog, ACTIVITY_LOG } = require('../core/logger');
+const { isAuthRequired, checkPassword, createSession, isValidSession, destroySession, parseCookies, SESSION_TTL_MS } = require('../core/auth');
 
-const ROOT_DIR = path.resolve(__dirname, '..');
 const LIST_FILE = path.join(ROOT_DIR, 'list.txt');
 const STATUS_FILE = path.join(ROOT_DIR, 'list_status.txt');
 const WEBUI_DIST = path.join(ROOT_DIR, 'webui', 'dist');
 
 const PORT = parseInt(process.env.PORT, 10) || 8080;
+const SESSION_COOKIE = 'nhdl_session';
 
 const engine = new DownloaderEngine();
 
@@ -98,7 +103,93 @@ engine.on('batch_complete', () => {
     }
 });
 
+function renderLoginPage(error) {
+    return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NHDL Daemon — Login</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#111111; color:#e0e0e0; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+  form { width: 320px; background:#161616; border:1px solid #2a2a2a; border-radius:6px; padding:28px; }
+  h1 { font-size:14px; letter-spacing:0.08em; text-transform:uppercase; margin:0 0 18px; color:#fff; }
+  input { width:100%; background:#0a0a0a; border:1px solid #2a2a2a; color:#fff; padding:10px 12px; border-radius:4px; font-size:13px; font-family:inherit; }
+  input:focus { outline:none; border-color:#a3e635; }
+  button { width:100%; margin-top:12px; background:#a3e635; color:#000; border:none; padding:10px; font-weight:700; font-size:12px; letter-spacing:0.05em; text-transform:uppercase; border-radius:4px; cursor:pointer; }
+  button:hover { background:#bef264; }
+  .err { color:#fff; background:#000; border:1px solid #fff; padding:8px 10px; border-radius:4px; font-size:12px; margin-bottom:12px; }
+</style></head>
+<body>
+  <form id="f">
+    <h1>&gt;_ NHDL_DAEMON</h1>
+    ${error ? `<div class="err">${error}</div>` : ''}
+    <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password" />
+    <button type="submit">Unlock</button>
+  </form>
+  <script>
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const password = e.target.password.value;
+      const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
+      if (res.ok) { window.location.reload(); }
+      else { window.location.href = '/?error=1'; }
+    });
+  </script>
+</body></html>`;
+}
+
 const server = http.createServer((req, res) => {
+    // One-time-login gate — only active when NHDL_PASSWORD is set. Sessions are held in
+    // memory server-side; the cookie just carries an opaque token, never the password.
+    if (isAuthRequired()) {
+        const cookies = parseCookies(req.headers.cookie);
+        const authed = isValidSession(cookies[SESSION_COOKIE]);
+
+        if (req.method === 'POST' && req.url === '/api/login') {
+            let body = '';
+            req.on('data', chunk => { body += chunk.toString(); });
+            req.on('end', () => {
+                res.setHeader('Content-Type', 'application/json');
+                try {
+                    const { password } = JSON.parse(body);
+                    if (checkPassword(password)) {
+                        const token = createSession();
+                        res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${token}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax`);
+                        logActivity('Login: success');
+                        return res.end(JSON.stringify({ success: true }));
+                    }
+                    logActivity('Login: wrong password');
+                    res.writeHead(401);
+                    return res.end(JSON.stringify({ success: false, error: 'Wrong password' }));
+                } catch (e) {
+                    res.writeHead(400);
+                    return res.end(JSON.stringify({ success: false, error: 'Bad request' }));
+                }
+            });
+            return;
+        }
+
+        if (req.method === 'POST' && req.url === '/api/logout') {
+            destroySession(cookies[SESSION_COOKIE]);
+            res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0`);
+            res.setHeader('Content-Type', 'application/json');
+            logActivity('Logout');
+            return res.end(JSON.stringify({ success: true }));
+        }
+
+        if (!authed) {
+            if (req.url.startsWith('/api/')) {
+                res.setHeader('Content-Type', 'application/json');
+                res.writeHead(401);
+                return res.end(JSON.stringify({ error: 'Unauthorized' }));
+            }
+            const urlObj = new URL(req.url, 'http://localhost');
+            const hasError = urlObj.searchParams.get('error') === '1';
+            res.setHeader('Content-Type', 'text/html');
+            return res.end(renderLoginPage(hasError ? 'Wrong password' : null));
+        }
+    }
+
     // API Endpoints
     if (req.url.startsWith('/api/')) {
         res.setHeader('Content-Type', 'application/json');
@@ -262,7 +353,8 @@ const server = http.createServer((req, res) => {
             return res.end(JSON.stringify({
                 downloadDir: engine.baseDownloadDir,
                 downloadFormat: engine.downloadFormat,
-                autoContinueBatches: engine.autoContinueBatches
+                autoContinueBatches: engine.autoContinueBatches,
+                authRequired: isAuthRequired()
             }));
         }
 
