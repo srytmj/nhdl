@@ -11,7 +11,7 @@ FROM node:20-alpine
 RUN apk add --no-cache curl
 WORKDIR /app
 
-COPY package*.json ./ 2>/dev/null || true
+COPY package*.json ./
 COPY . .
 COPY --from=builder /app/webui/dist ./webui/dist
 
@@ -20,6 +20,6 @@ ENV TZ=Asia/Jakarta
 ENV WEB_GUI=true
 
 EXPOSE 8080
-VOLUME ["/downloads", "/app"]
+VOLUME ["/downloads"]
 
 CMD ["node", "server/index.js"]
