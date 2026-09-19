@@ -176,6 +176,31 @@ function buildDisplayName(title, author) {
     return title;
 }
 
+// Reverses buildDisplayName() using whatever a previous successful run already wrote into
+// list.txt (e.g. "Kazuhiro - Gal's Bitch Shijou Shugi!"). Lets processGallery check disk
+// for an already-downloaded file using a cached title WITHOUT hitting the network first —
+// the one case that matters is exactly a Cloudflare 429 blocking a fresh metadata fetch for
+// a gallery whose library.json entry was lost but whose file is still sitting on disk.
+function getCachedDisplayName(listPath, galleryId) {
+    if (!listPath || !fs.existsSync(listPath)) return null;
+    try {
+        const lines = fs.readFileSync(listPath, 'utf-8').split('\n');
+        for (const line of lines) {
+            if (line.trim().startsWith('#') || line.trim() === '') continue;
+            const m = line.match(/(?:nhentai\.net\/g\/|^)\s*(\d+)\b[^|]*\|\s*(.+)$/);
+            if (m && m[1] === galleryId.toString()) {
+                const full = m[2].trim();
+                const sepIdx = full.indexOf(' - ');
+                if (sepIdx > 0) {
+                    return { author: full.slice(0, sepIdx), title: full.slice(sepIdx + 3) };
+                }
+                return { author: null, title: full };
+            }
+        }
+    } catch (e) {}
+    return null;
+}
+
 // Rewrites the raw list.txt line for a gallery ID with a fuller display name
 // (title + artist/group), once we actually have that metadata — reuses data already
 // fetched during the normal download flow, so this never triggers an extra network request.
@@ -479,6 +504,7 @@ module.exports = {
     isLibraryEntryValid,
     isPermanentlySkipped,
     buildDisplayName,
+    getCachedDisplayName,
     updateListDisplayName,
     trackerFileToListPath,
     rescanLibrary,
