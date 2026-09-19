@@ -117,9 +117,22 @@ async function requestDownloadUrl(galleryId, format, apiKey) {
     }
 }
 
-// Downloads the (presigned, non-nhentai.net) archive URL straight to disk. No IP pinning
-// here — the URL points at whatever CDN/storage the API handed back, not the
-// Cloudflare-fronted nhentai.net domain, so a plain curl fetch is fine.
+// The download URL the API hands back is still on an *.nhentai.net subdomain (i1-i4, same
+// family as the regular image CDN) — on networks where the ISP's DNS resolver hijacks/
+// blackholes nhentai.net's real records (observed on the homelab server: every *.nhentai.net
+// name resolved to an unreachable 202.169.x.x instead of Cloudflare), that subdomain needs
+// the exact same --resolve pin engine.js's own resolveDomain() already applies to the
+// per-page CDN host. Skip pinning for anything that ISN'T nhentai.net, in case the API ever
+// hands back a URL on unrelated third-party storage.
+function resolveFlagsForUrl(url) {
+    try {
+        const hostname = new URL(url).hostname;
+        if (hostname.includes('nhentai.net')) return `--resolve ${hostname}:443:${NHENTAI_MAIN_IP}`;
+    } catch (e) {}
+    return '';
+}
+
+// Downloads the presigned archive URL straight to disk.
 // Retries twice on transient failures (a cold connection blip shouldn't force a fall back
 // to the much slower per-page CDN path) before giving up — the presigned URL is usually
 // valid for a couple minutes, so a short retry window doesn't risk it expiring mid-retry.
@@ -128,7 +141,7 @@ async function downloadArchiveFile(url, destPath, attempts = 3) {
     // abort if the transfer stalls (drops under ~1KB/s for 15s straight) instead of hanging
     // forever on a half-open connection — the `timeout` exec option below is a hard backstop
     // in case curl itself ignores those flags for some reason.
-    const curlCmd = `${CURL_BIN} -skL ${CURL_EXTRA_FLAGS} --connect-timeout 10 --max-time 180 --speed-limit 1000 --speed-time 15 -o "${destPath}" "${url}"`;
+    const curlCmd = `${CURL_BIN} -skL ${CURL_EXTRA_FLAGS} ${resolveFlagsForUrl(url)} --connect-timeout 10 --max-time 180 --speed-limit 1000 --speed-time 15 -o "${destPath}" "${url}"`;
     let lastReason = '';
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
