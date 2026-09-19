@@ -8,7 +8,7 @@ const path = require('path');
 const dns = require('dns');
 
 const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, sleep, withFsRetryAsync, atomicWriteFileSync } = require('./utils');
-const { loadLibrary, saveToLibrary, saveArchivedToLibrary, saveSkippedToLibrary, logError, updateListStatus, isLibraryEntryValid, isPermanentlySkipped, buildDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, setStateDir } = require('./tracker');
+const { loadLibrary, saveToLibrary, saveArchivedToLibrary, saveSkippedToLibrary, logError, updateListStatus, isLibraryEntryValid, isPermanentlySkipped, buildDisplayName, getCachedDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, setStateDir } = require('./tracker');
 const { logActivity, setLogDir } = require('./logger');
 
 dns.setServers(['1.1.1.1', '8.8.8.8']);
@@ -63,6 +63,12 @@ class DownloaderEngine extends EventEmitter {
         this.isPaused = false;
         this.forceRetry = false;
         this.currentProgress = null;
+
+        // Anti-rate-limit state: every consecutive 429 makes the engine more cautious
+        // (longer waits, slower pacing). Any fully successful real download resets this
+        // back to normal speed. See the RATE_LIMIT handling in runBatch().
+        this.consecutiveRateLimits = 0;
+        this.circuitBreakerTripped = false;
     }
 
     pause() {
@@ -72,6 +78,10 @@ class DownloaderEngine extends EventEmitter {
 
     resume() {
         this.isPaused = false;
+        // A manual resume is a deliberate human decision that enough time has passed —
+        // give it a clean slate instead of immediately re-tripping on the old count.
+        this.consecutiveRateLimits = 0;
+        this.circuitBreakerTripped = false;
         this.emit('resumed');
     }
 
@@ -242,6 +252,71 @@ class DownloaderEngine extends EventEmitter {
         });
     }
 
+    // Searches the whole download tree for a folder or archive matching a (possibly stale)
+    // cached title, without needing a language/author breakdown from fresh metadata. Used
+    // only as a 429 fallback — see the RATE_LIMIT branch in processGallery().
+    findExistingOnDisk(cachedTitle, cachedAuthor) {
+        const sanitizedTitle = sanitizeName(cachedTitle);
+        if (!sanitizedTitle) return null;
+        const sanitizedAuthor = cachedAuthor ? sanitizeName(cachedAuthor) : null;
+
+        let langDirs;
+        try {
+            langDirs = fs.readdirSync(this.baseDownloadDir, { withFileTypes: true }).filter(d => d.isDirectory());
+        } catch (e) { return null; }
+
+        for (const langDir of langDirs) {
+            let authorDirs;
+            const langPath = path.join(this.baseDownloadDir, langDir.name);
+            try {
+                authorDirs = fs.readdirSync(langPath, { withFileTypes: true }).filter(d => d.isDirectory());
+            } catch (e) { continue; }
+
+            for (const authorDir of authorDirs) {
+                if (sanitizedAuthor && authorDir.name !== sanitizedAuthor) continue;
+                const parentDir = path.join(langPath, authorDir.name);
+                let siblings;
+                try {
+                    siblings = fs.readdirSync(parentDir, { withFileTypes: true });
+                } catch (e) { continue; }
+
+                const archiveMatch = siblings.find(d => {
+                    if (!d.isFile()) return false;
+                    const m = d.name.match(/^(.*)\.(cbz|zip)$/i);
+                    return m && m[1].startsWith(sanitizedTitle);
+                });
+                if (archiveMatch) {
+                    const archiveExt = archiveMatch.name.match(/\.(cbz|zip)$/i)[1].toLowerCase();
+                    return { archived: true, path: path.join(parentDir, archiveMatch.name), title: cachedTitle, archiveExt, pages: 0 };
+                }
+
+                const folderMatch = siblings.find(d => d.isDirectory() && d.name.startsWith(sanitizedTitle));
+                if (folderMatch) {
+                    const folderPath = path.join(parentDir, folderMatch.name);
+                    let files;
+                    try {
+                        files = fs.readdirSync(folderPath).filter(f => /^\d+\.(jpg|jpeg|png|webp|gif)$/i.test(f));
+                    } catch (e) { files = []; }
+                    if (files.length === 0) continue;
+                    const pageExts = {};
+                    let maxPage = 0;
+                    let ext = 'jpg';
+                    for (const f of files) {
+                        const m = f.match(/^(\d+)\.(\w+)$/);
+                        if (m) {
+                            const p = parseInt(m[1], 10);
+                            pageExts[p] = m[2];
+                            ext = m[2];
+                            if (p > maxPage) maxPage = p;
+                        }
+                    }
+                    return { archived: false, path: folderPath, title: cachedTitle, pages: maxPage, ext, pageExts };
+                }
+            }
+        }
+        return null;
+    }
+
     async fetchMetadata(galleryId) {
         const curlCmd = `${CURL_BIN} -skL --resolve nhentai.net:443:${NHENTAI_MAIN_IP} -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" https://nhentai.net/g/${galleryId}/`;
         let html = '';
@@ -355,6 +430,29 @@ class DownloaderEngine extends EventEmitter {
 
         const meta = await this.fetchMetadata(galleryId);
         if (meta.status === "RATE_LIMIT") {
+            // Before committing to a 5-minute cooldown: if a previous run already got far
+            // enough to write this gallery's title into list.txt, use that cached name to
+            // check disk directly — no network needed for that. Covers exactly the case
+            // where library.json lost track of an already-finished download (e.g. the
+            // corruption incident) and a 429 on the metadata re-fetch would otherwise block
+            // ever discovering the file is already there.
+            const cached = trackerFile ? getCachedDisplayName(trackerFileToListPath(trackerFile), galleryId) : null;
+            if (cached && cached.title) {
+                const found = this.findExistingOnDisk(cached.title, cached.author);
+                if (found) {
+                    if (found.archived) {
+                        saveArchivedToLibrary(galleryId, found.title, found.path, found.archiveExt, { author: cached.author });
+                    } else {
+                        saveToLibrary(galleryId, found.title, found.path, found.pages, found.ext, found.pageExts, { author: cached.author });
+                    }
+                    if (trackerFile) {
+                        updateListStatus(trackerFile, galleryId, "SKIPPED - Found on disk (metadata was 429'd)");
+                    }
+                    logActivity(`SKIPPED ID ${galleryId}: found existing file on disk, avoided 429 cooldown`);
+                    this.emit('skipped', { galleryId, title: found.title, currentTaskNum, totalTasks, reason: 'Already on disk (metadata blocked by 429)' });
+                    return { status: "SUCCESS", numPages: found.pages || 0, skipped: true };
+                }
+            }
             logError(galleryId, "Cloudflare Rate Limit / Challenge (429)");
             if (trackerFile) updateListStatus(trackerFile, galleryId, "COOLDOWN - CLOUDFLARE 429");
             return { status: "RATE_LIMIT" };
@@ -608,6 +706,15 @@ class DownloaderEngine extends EventEmitter {
             return;
         }
 
+        // Startup jitter: every container restart used to start hammering nhentai
+        // immediately, and several restarts close together (exactly what happened during
+        // today's incident/debugging) sent bursts of near-simultaneous requests that look
+        // bot-like to Cloudflare. A small random pause before the very first request breaks
+        // up that pattern for free.
+        const startupJitterMs = 5000 + Math.floor(Math.random() * 10000);
+        logActivity(`Run starting in ${Math.round(startupJitterMs / 1000)}s (startup jitter, anti-burst)`);
+        await sleep(startupJitterMs);
+
         for (let i = 0; i < pendingIds.length; i++) {
             if (this.isStopped) break;
             while (this.isPaused && !this.isStopped) {
@@ -636,11 +743,34 @@ class DownloaderEngine extends EventEmitter {
                 }
             }
 
-            // Cloudflare 429 Cooldown loop
+            // Cloudflare 429 Cooldown loop — escalating backoff + circuit breaker.
+            // A fixed 5-minute wait that keeps retrying forever is exactly what turned one
+            // 429 into a full Cloudflare JS-challenge IP flag: repeatedly poking a service
+            // that just told you to back off makes things worse, not better. Every
+            // consecutive 429 (across the whole run, not just this gallery) now doubles the
+            // wait, and after too many in a row we stop entirely and require a human to look
+            // instead of continuing to hammer it unattended.
+            const MAX_CONSECUTIVE_RATE_LIMITS = 3;
+            const BASE_RATE_LIMIT_WAIT = 5 * 60;
+            const MAX_RATE_LIMIT_WAIT = 60 * 60;
+
             while (result && result.status === "RATE_LIMIT" && !this.isStopped) {
-                const waitSeconds = 5 * 60;
-                logActivity(`RATE LIMIT ID ${id}: cooling down ${waitSeconds}s`);
-                this.emit('rate_limit', { galleryId: id, waitSeconds });
+                this.consecutiveRateLimits++;
+
+                if (this.consecutiveRateLimits > MAX_CONSECUTIVE_RATE_LIMITS) {
+                    this.circuitBreakerTripped = true;
+                    const msg = `Circuit breaker: ${this.consecutiveRateLimits - 1} consecutive rate limits — pausing the run entirely instead of continuing to hammer nhentai. Resume manually once the flag has had time to cool down.`;
+                    logActivity(`CIRCUIT BREAKER: ${msg}`);
+                    logError(id, msg);
+                    this.emit('circuit_breaker', { galleryId: id, consecutiveRateLimits: this.consecutiveRateLimits - 1 });
+                    this.pause();
+                    if (trackerFile) updateListStatus(trackerFile, id, "PAUSED - Circuit breaker (too many 429s)");
+                    break;
+                }
+
+                const waitSeconds = Math.min(BASE_RATE_LIMIT_WAIT * 2 ** (this.consecutiveRateLimits - 1), MAX_RATE_LIMIT_WAIT);
+                logActivity(`RATE LIMIT ID ${id}: cooling down ${waitSeconds}s (consecutive hit #${this.consecutiveRateLimits})`);
+                this.emit('rate_limit', { galleryId: id, waitSeconds, consecutiveRateLimits: this.consecutiveRateLimits });
                 for (let s = waitSeconds; s > 0; s--) {
                     if (this.isStopped || this.forceRetry) break;
                     while (this.isPaused && !this.isStopped && !this.forceRetry) {
@@ -652,7 +782,7 @@ class DownloaderEngine extends EventEmitter {
                     const sRem = s % 60;
                     this.currentProgress = {
                         type: 'RATE_LIMIT',
-                        title: `Rate Limit 429 - Cooldown IP`,
+                        title: `Rate Limit 429 - Cooldown IP (hit #${this.consecutiveRateLimits})`,
                         message: `Retrying in: ${m}m ${sRem}s`,
                         percent: Math.round(((waitSeconds - s) / waitSeconds) * 100),
                         remaining: s,
@@ -668,6 +798,14 @@ class DownloaderEngine extends EventEmitter {
                     this.currentProgress = null;
                 }
                 result = await this.processGallery(id, i + 1, pendingIds.length, trackerFile);
+            }
+
+            if (this.circuitBreakerTripped) break;
+
+            // Any real success (download OR a genuine metadata fetch that wasn't rate
+            // limited) proves we're not currently flagged — safe to reset back to full speed.
+            if (result && result.status !== "RATE_LIMIT") {
+                this.consecutiveRateLimits = 0;
             }
 
             // A skip (already fully downloaded, per library.json/marker files) never touched
