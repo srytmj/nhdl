@@ -27,4 +27,36 @@ function loadEnvFile(rootDir) {
     } catch (e) {}
 }
 
-module.exports = { loadEnvFile };
+// Writes/updates a single KEY=VALUE line in .env, preserving every other line
+// (comments, blank lines, other keys) as-is. Creates the file if it doesn't exist yet.
+function saveEnvValue(rootDir, key, value) {
+    const envPath = path.join(rootDir, '.env');
+    let lines = [];
+    if (fs.existsSync(envPath)) {
+        lines = fs.readFileSync(envPath, 'utf-8').split('\n');
+    }
+
+    let found = false;
+    const newLines = lines.map(line => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('#') || trimmed === '') return line;
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) return line;
+        const lineKey = trimmed.slice(0, eq).trim();
+        if (lineKey === key) {
+            found = true;
+            return `${key}=${value}`;
+        }
+        return line;
+    });
+
+    if (!found) {
+        if (newLines.length && newLines[newLines.length - 1].trim() !== '') newLines.push('');
+        newLines.push(`${key}=${value}`);
+    }
+
+    fs.writeFileSync(envPath, newLines.join('\n'), 'utf-8');
+    process.env[key] = value;
+}
+
+module.exports = { loadEnvFile, saveEnvValue };

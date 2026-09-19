@@ -2,9 +2,11 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const { loadEnvFile } = require('../core/env');
+const { loadEnvFile, saveEnvValue } = require('../core/env');
 const ROOT_DIR = path.resolve(__dirname, '..');
 loadEnvFile(ROOT_DIR);
+
+const { verifyApiKey } = require('../core/nhentaiApi');
 
 const DownloaderEngine = require('../core/engine');
 const { DEFAULT_ERROR_LOG, syncListTracker, updateListStatus, loadLibrary, rescanLibrary, renameLibraryEntry, compressLibraryEntry } = require('../core/tracker');
@@ -350,11 +352,14 @@ const server = http.createServer((req, res) => {
         }
 
         if (req.method === 'GET' && req.url === '/api/config') {
+            const apiKey = process.env.NHENTAI_API_KEY || '';
             return res.end(JSON.stringify({
                 downloadDir: engine.baseDownloadDir,
                 downloadFormat: engine.downloadFormat,
                 autoContinueBatches: engine.autoContinueBatches,
-                authRequired: isAuthRequired()
+                authRequired: isAuthRequired(),
+                apiKeyConfigured: !!apiKey,
+                apiKeyMasked: apiKey ? `${apiKey.slice(0, 4)}${'*'.repeat(Math.max(apiKey.length - 8, 4))}${apiKey.slice(-4)}` : ''
             }));
         }
 
@@ -363,7 +368,7 @@ const server = http.createServer((req, res) => {
             req.on('data', chunk => { body += chunk.toString(); });
             req.on('end', () => {
                 try {
-                    const { downloadDir, downloadFormat, autoContinueBatches } = JSON.parse(body);
+                    const { downloadDir, downloadFormat, autoContinueBatches, apiKey } = JSON.parse(body);
                     if (typeof autoContinueBatches === 'boolean') {
                         engine.setAutoContinueBatches(autoContinueBatches);
                         return res.end(JSON.stringify({ success: true, autoContinueBatches: engine.autoContinueBatches }));
@@ -379,11 +384,36 @@ const server = http.createServer((req, res) => {
                         engine.setDownloadDir(downloadDir);
                         return res.end(JSON.stringify({ success: true, downloadDir: engine.baseDownloadDir }));
                     }
+                    if (typeof apiKey === 'string') {
+                        if (!apiKey.trim()) {
+                            res.writeHead(400);
+                            return res.end(JSON.stringify({ success: false, error: 'API key kosong' }));
+                        }
+                        saveEnvValue(ROOT_DIR, 'NHENTAI_API_KEY', apiKey.trim());
+                        return res.end(JSON.stringify({ success: true }));
+                    }
                     res.writeHead(400);
                     res.end(JSON.stringify({ success: false, error: 'Invalid payload' }));
                 } catch (e) {
                     res.writeHead(500);
                     res.end(JSON.stringify({ success: false, error: e.message }));
+                }
+            });
+            return;
+        }
+
+        if (req.method === 'POST' && req.url === '/api/config/verify-key') {
+            let body = '';
+            req.on('data', chunk => { body += chunk.toString(); });
+            req.on('end', async () => {
+                try {
+                    const { apiKey } = JSON.parse(body || '{}');
+                    const keyToCheck = typeof apiKey === 'string' && apiKey.trim() ? apiKey.trim() : process.env.NHENTAI_API_KEY;
+                    const result = await verifyApiKey(keyToCheck);
+                    res.end(JSON.stringify(result));
+                } catch (e) {
+                    res.writeHead(500);
+                    res.end(JSON.stringify({ valid: false, error: e.message }));
                 }
             });
             return;

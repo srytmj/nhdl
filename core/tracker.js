@@ -31,7 +31,8 @@ function saveToLibrary(id, title, folder, pages, ext, pageExts = {}, extra = {},
             pageExts,
             author: extra.author || null,
             lang: extra.lang || null,
-            downloadedAt: new Date().toISOString()
+            downloadedAt: new Date().toISOString(),
+            ...(extra.extraMeta ? { meta: extra.extraMeta } : {})
         };
         fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
 
@@ -411,6 +412,44 @@ function compressLibraryEntry(id, options = {}, libFile = DEFAULT_LIBRARY_FILE) 
     return { success: true, cbzPath, pages: files.length, sizeBytes: zipBuf.length };
 }
 
+// Picks a free "<parentDir>/<baseName>.<ext>" path, appending " (2)", " (3)", ... on
+// collision — same scheme compressLibraryEntry uses, extracted so the API-download path
+// (which writes an archive directly, never via compressLibraryEntry) can reuse it.
+function uniqueArchivePath(parentDir, baseName, ext) {
+    let archivePath = path.join(parentDir, `${baseName}.${ext}`);
+    let suffix = 2;
+    while (fs.existsSync(archivePath)) {
+        archivePath = path.join(parentDir, `${baseName} (${suffix}).${ext}`);
+        suffix++;
+    }
+    return archivePath;
+}
+
+// Records a gallery that was downloaded as a ready-made archive (via the API's bulk
+// download endpoint) straight into library.json, skipping the loose-folder bookkeeping
+// saveToLibrary expects — there is no folder, just the archive file itself.
+function saveArchivedGallery(id, title, archivePath, ext, extra = {}, libFile = DEFAULT_LIBRARY_FILE) {
+    try {
+        const library = loadLibrary(libFile);
+        library[id] = {
+            title,
+            folder: archivePath,
+            pages: extra.pages || null,
+            ext,
+            pageExts: {},
+            author: extra.author || null,
+            lang: extra.lang || null,
+            archived: true,
+            archiveExt: ext,
+            downloadedAt: new Date().toISOString(),
+            ...(extra.extraMeta ? { meta: extra.extraMeta } : {})
+        };
+        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+    } catch (e) {
+        console.error("Failed to save to library.json:", e.message);
+    }
+}
+
 module.exports = {
     DEFAULT_LIBRARY_FILE,
     DEFAULT_ERROR_LOG,
@@ -426,5 +465,7 @@ module.exports = {
     rescanLibrary,
     renameLibraryEntry,
     compressLibraryEntry,
-    getBatchFormatForGallery
+    getBatchFormatForGallery,
+    uniqueArchivePath,
+    saveArchivedGallery
 };

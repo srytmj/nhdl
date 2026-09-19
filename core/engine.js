@@ -8,8 +8,9 @@ const path = require('path');
 const dns = require('dns');
 
 const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, sleep } = require('./utils');
-const { loadLibrary, saveToLibrary, logError, updateListStatus, isLibraryEntryValid, buildDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery } = require('./tracker');
+const { loadLibrary, saveToLibrary, logError, updateListStatus, isLibraryEntryValid, buildDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, uniqueArchivePath, saveArchivedGallery } = require('./tracker');
 const { logActivity } = require('./logger');
+const { fetchGalleryMetadata, requestDownloadUrl, downloadArchiveFile } = require('./nhentaiApi');
 
 dns.setServers(['1.1.1.1', '8.8.8.8']);
 const NHENTAI_MAIN_IP = '104.26.4.188';
@@ -234,7 +235,56 @@ class DownloaderEngine extends EventEmitter {
         });
     }
 
+    // API-first: the official JSON endpoint is public (no key needed, though a key raises
+    // the rate limit from 20/min to 45/min), returns structured data instead of regex-prone
+    // HTML, and hands back every field nhentai tracks for a gallery — not just the handful
+    // fetchMetadataViaHtml() extracts. Falls back to the old HTML scrape on any failure
+    // (network error, unexpected shape, 429, etc.) so behavior never regresses.
     async fetchMetadata(galleryId) {
+        const apiResult = await fetchGalleryMetadata(galleryId, process.env.NHENTAI_API_KEY);
+        if (apiResult.success) {
+            const data = apiResult.data;
+            const title = (data.title && (data.title.english || data.title.pretty || data.title.japanese)) || "Unknown_Title";
+            const mediaId = data.media_id;
+            const numPages = data.num_pages || (data.pages ? data.pages.length : 0);
+
+            const pageExts = {};
+            let ext = "jpg";
+            (data.pages || []).forEach(p => {
+                const m = p.path && p.path.match(/\.(jpg|jpeg|png|webp|gif)$/i);
+                const pageExt = m ? m[1].toLowerCase() : 'jpg';
+                pageExts[p.number] = pageExt;
+                if (p.number === 1) ext = pageExt;
+            });
+
+            const tags = data.tags || [];
+            const langTag = [...tags].reverse().find(t => t.type === 'language');
+            const langStr = langTag ? toTitleCase(langTag.name) : "Unknown";
+            const artistTag = tags.find(t => t.type === 'artist');
+            const groupTag = tags.find(t => t.type === 'group');
+            const authorStr = artistTag ? toTitleCase(artistTag.name) : (groupTag ? toTitleCase(groupTag.name) : "Other");
+
+            return {
+                title, mediaId, numPages, ext, pageExts, langStr, authorStr,
+                extraMeta: {
+                    tags,
+                    numFavorites: data.num_favorites,
+                    uploadDate: data.upload_date,
+                    scanlator: data.scanlator,
+                    titleEnglish: data.title && data.title.english,
+                    titleJapanese: data.title && data.title.japanese,
+                    titlePretty: data.title && data.title.pretty,
+                    cover: data.cover,
+                    thumbnail: data.thumbnail
+                }
+            };
+        }
+        if (apiResult.notFound) throw new Error("404 Page (Gallery not found / already removed)");
+        logActivity(`API metadata failed for ID ${galleryId}, falling back to HTML scrape: ${apiResult.reason}`);
+        return this.fetchMetadataViaHtml(galleryId);
+    }
+
+    async fetchMetadataViaHtml(galleryId) {
         const curlCmd = `${CURL_BIN} -skL --resolve nhentai.net:443:${NHENTAI_MAIN_IP} -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" https://nhentai.net/g/${galleryId}/`;
         let html = '';
         try {
@@ -310,6 +360,38 @@ class DownloaderEngine extends EventEmitter {
         };
     }
 
+    // Fast path: ask the official API for a ready-made archive instead of downloading pages
+    // one by one. Returns a processGallery() result object on success, or null to signal
+    // "fall back to the normal per-page CDN flow" (bad key, feature disabled, rate limited,
+    // network error — anything that isn't a clean success is treated as non-fatal here).
+    async tryApiArchiveDownload(galleryId, format, apiKey, ctx) {
+        const { sanitizedTitle, title, folderPath, numPages, authorStr, langStr, extraMeta, currentTaskNum, totalTasks, trackerFile } = ctx;
+
+        const urlResult = await requestDownloadUrl(galleryId, format, apiKey);
+        if (!urlResult.success) {
+            logActivity(`API download skipped for ID ${galleryId}, falling back to CDN: ${urlResult.reason}`);
+            return null;
+        }
+
+        const parentDir = path.dirname(folderPath);
+        if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
+        const archivePath = uniqueArchivePath(parentDir, sanitizedTitle, format);
+
+        const dlResult = await downloadArchiveFile(urlResult.url, archivePath);
+        if (!dlResult.success) {
+            logActivity(`API download failed for ID ${galleryId}, falling back to CDN: ${dlResult.reason}`);
+            if (fs.existsSync(archivePath)) { try { fs.unlinkSync(archivePath); } catch (e) {} }
+            return null;
+        }
+
+        saveArchivedGallery(galleryId, sanitizedTitle, archivePath, format, { author: authorStr, lang: langStr, pages: numPages, extraMeta });
+        if (trackerFile) updateListStatus(trackerFile, galleryId, "DONE");
+        logActivity(`DONE ID ${galleryId}: "${title}" (${numPages} pages, via API)`);
+        this.currentProgress = null;
+        this.emit('done', { galleryId, title, pages: numPages, currentTaskNum, totalTasks });
+        return { status: "SUCCESS", numPages };
+    }
+
     async processGallery(galleryId, currentTaskNum = 1, totalTasks = 1, trackerFile = null) {
         if (trackerFile) updateListStatus(trackerFile, galleryId, "ON_PROGRESS");
 
@@ -348,7 +430,7 @@ class DownloaderEngine extends EventEmitter {
             return { status: "RATE_LIMIT" };
         }
 
-        const { title, mediaId, numPages, ext, pageExts, langStr, authorStr } = meta;
+        const { title, mediaId, numPages, ext, pageExts, langStr, authorStr, extraMeta } = meta;
         const extFor = (page) => pageExts[page] || ext;
         const sanitizedLang = sanitizeName(langStr);
         const sanitizedAuthor = sanitizeName(authorStr);
@@ -361,6 +443,19 @@ class DownloaderEngine extends EventEmitter {
         }
 
         const folderPath = path.join(this.baseDownloadDir, sanitizedLang, sanitizedAuthor, sanitizedTitle);
+
+        const apiKey = process.env.NHENTAI_API_KEY;
+        const targetFormat = trackerFile
+            ? getBatchFormatForGallery(trackerFileToListPath(trackerFile), galleryId)
+            : this.downloadFormat;
+        if (apiKey && (targetFormat === 'cbz' || targetFormat === 'zip')) {
+            const apiResult = await this.tryApiArchiveDownload(galleryId, targetFormat, apiKey, {
+                sanitizedTitle, title, folderPath, numPages, authorStr, langStr, extraMeta,
+                currentTaskNum, totalTasks, trackerFile
+            });
+            if (apiResult) return apiResult;
+        }
+
         if (!fs.existsSync(folderPath)) {
             fs.mkdirSync(folderPath, { recursive: true });
         }
@@ -379,7 +474,7 @@ class DownloaderEngine extends EventEmitter {
         }
 
         if (completed === numPages) {
-            saveToLibrary(galleryId, sanitizedTitle, folderPath, numPages, ext, pageExts, { author: authorStr, lang: langStr });
+            saveToLibrary(galleryId, sanitizedTitle, folderPath, numPages, ext, pageExts, { author: authorStr, lang: langStr, extraMeta });
             this.maybeCompress(galleryId, trackerFile);
             if (trackerFile) updateListStatus(trackerFile, galleryId, "SKIPPED - Files Complete");
             this.emit('skipped', { galleryId, title, currentTaskNum, totalTasks, reason: 'Files 100% Complete' });
@@ -448,7 +543,7 @@ class DownloaderEngine extends EventEmitter {
                 }
                 if (pendingPages.length === 0 && active === 0) {
                     clearInterval(heartbeat);
-                    saveToLibrary(galleryId, sanitizedTitle, folderPath, numPages, ext, pageExts, { author: authorStr, lang: langStr });
+                    saveToLibrary(galleryId, sanitizedTitle, folderPath, numPages, ext, pageExts, { author: authorStr, lang: langStr, extraMeta });
                     this.maybeCompress(galleryId, trackerFile);
                     if (trackerFile) updateListStatus(trackerFile, galleryId, "DONE");
                     logActivity(`DONE ID ${galleryId}: "${title}" (${numPages} pages)`);

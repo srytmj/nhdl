@@ -331,6 +331,14 @@
     let downloadFormat = 'folder';
     let autoContinueBatches = true;
 
+    // nhentai v2 API key — stored server-side in .env (survives restarts), never
+    // echoed back in full: /api/config only gives us a masked preview once saved.
+    let apiKeyInput = '';
+    let apiKeyConfigured = false;
+    let apiKeyMasked = '';
+    let apiKeyStatus = 'idle'; // idle | checking | valid | invalid | saving
+    let apiKeyError = '';
+
     async function loadConfig() {
         try {
             const res = await fetch('/api/config');
@@ -339,10 +347,62 @@
                 downloadDir = data.downloadDir;
                 selectedDir = data.downloadDir;
             }
-            if (data.downloadFormat) downloadFormat = data.downloadFormat;
+            if (data.downloadFormat) {
+                downloadFormat = data.downloadFormat;
+                insertFormat = data.downloadFormat;
+            }
             if (typeof data.autoContinueBatches === 'boolean') autoContinueBatches = data.autoContinueBatches;
             if (typeof data.authRequired === 'boolean') authRequired = data.authRequired;
+            apiKeyConfigured = !!data.apiKeyConfigured;
+            apiKeyMasked = data.apiKeyMasked || '';
         } catch(e) {}
+    }
+
+    async function saveApiKey() {
+        if (!apiKeyInput.trim()) return;
+        apiKeyStatus = 'saving';
+        apiKeyError = '';
+        try {
+            const res = await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ apiKey: apiKeyInput.trim() })
+            });
+            const data = await res.json();
+            if (!data.success) {
+                apiKeyStatus = 'idle';
+                apiKeyError = data.error || 'Gagal menyimpan API key';
+                return;
+            }
+            await verifyApiKey();
+            await loadConfig();
+            apiKeyInput = '';
+        } catch (e) {
+            apiKeyStatus = 'idle';
+            apiKeyError = 'Gagal menyimpan API key';
+        }
+    }
+
+    async function verifyApiKey() {
+        apiKeyStatus = 'checking';
+        apiKeyError = '';
+        try {
+            const res = await fetch('/api/config/verify-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ apiKey: apiKeyInput.trim() || undefined })
+            });
+            const data = await res.json();
+            if (data.valid) {
+                apiKeyStatus = 'valid';
+            } else {
+                apiKeyStatus = 'invalid';
+                apiKeyError = data.error || 'API key tidak valid';
+            }
+        } catch (e) {
+            apiKeyStatus = 'invalid';
+            apiKeyError = 'Gagal menghubungi server';
+        }
     }
 
     async function setDownloadFormat(format) {
@@ -1180,6 +1240,44 @@
                             WAIT
                         </button>
                     </div>
+                </div>
+
+                <!-- nhentai API Key -->
+                <div class="px-5 py-2.5 bg-[#171717] border-b border-[#262626] shrink-0">
+                    <div class="flex items-center justify-between mb-1.5">
+                        <span class="text-[11px] text-gray-500 font-bold uppercase">nhentai API Key (optional)</span>
+                        {#if apiKeyConfigured && apiKeyStatus === 'idle'}
+                            <span class="text-[10px] text-gray-600 font-mono">{apiKeyMasked}</span>
+                        {/if}
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <input
+                            type="password"
+                            bind:value={apiKeyInput}
+                            placeholder={apiKeyConfigured ? 'Masukkan key baru untuk mengganti...' : 'Tempel API key di sini...'}
+                            class="flex-1 bg-[#0f0f0f] border border-[#2c2c2c] rounded-sm px-2.5 py-1.5 text-[11px] text-gray-200 placeholder-gray-600 focus:outline-none focus:border-lime-400/50" />
+                        <button
+                            on:click={saveApiKey}
+                            disabled={!apiKeyInput.trim() || apiKeyStatus === 'saving' || apiKeyStatus === 'checking'}
+                            class="px-3 py-1.5 text-[11px] font-bold rounded-sm transition-colors bg-lime-400 text-black hover:bg-lime-300 disabled:opacity-40 disabled:cursor-not-allowed shrink-0">
+                            {apiKeyStatus === 'saving' ? 'SAVING...' : apiKeyStatus === 'checking' ? 'CHECKING...' : 'SAVE'}
+                        </button>
+                        {#if apiKeyConfigured}
+                            <button
+                                on:click={verifyApiKey}
+                                disabled={apiKeyStatus === 'saving' || apiKeyStatus === 'checking'}
+                                class="px-3 py-1.5 text-[11px] font-bold rounded-sm transition-colors bg-[#0f0f0f] border border-[#2c2c2c] text-gray-300 hover:text-white disabled:opacity-40 shrink-0">
+                                VERIFY
+                            </button>
+                        {/if}
+                    </div>
+                    {#if apiKeyStatus === 'valid'}
+                        <span class="text-[10px] text-lime-400 mt-1 block">✓ API key valid dan aktif</span>
+                    {:else if apiKeyStatus === 'invalid'}
+                        <span class="text-[10px] text-red-400 mt-1 block">✗ {apiKeyError}</span>
+                    {:else}
+                        <span class="text-[10px] text-gray-600 mt-1 block">Dipakai buat request lewat API resmi nhentai (limit lebih longgar). Disimpan di .env server, gak pernah ditampilkan utuh lagi.</span>
+                    {/if}
                 </div>
 
                 <!-- Drives Selection (Windows) -->
