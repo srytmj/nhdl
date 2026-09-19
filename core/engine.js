@@ -327,7 +327,10 @@ class DownloaderEngine extends EventEmitter {
         const apiResult = await fetchGalleryMetadata(galleryId, process.env.NHENTAI_API_KEY);
         if (apiResult.success) {
             const data = apiResult.data;
-            const title = (data.title && (data.title.english || data.title.pretty || data.title.japanese)) || "Unknown_Title";
+            // "pretty" is nhentai's own cleaned-up short title (no [circle/artist] tags,
+            // no [Language]/[Digital] suffixes) — use that for filenames; the long
+            // "english" title is still kept in extraMeta for anyone who wants it.
+            const title = (data.title && (data.title.pretty || data.title.english || data.title.japanese)) || "Unknown_Title";
             const mediaId = data.media_id;
             const numPages = data.num_pages || (data.pages ? data.pages.length : 0);
 
