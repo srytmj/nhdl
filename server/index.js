@@ -116,8 +116,13 @@ function autoProcessQueue() {
 // doesn't know about newly-added items. When one such run finishes, optionally pick up
 // anything new that was queued meanwhile (e.g. a later "Insert Target" paste) instead of
 // requiring the user to press START again.
-engine.on('batch_complete', () => {
-    if (engine.autoContinueBatches) {
+engine.on('batch_complete', (e) => {
+    // Guard against re-triggering on a batch that processed nothing: runBatch() emits
+    // batch_complete with processed:0 when every queued ID is already done, and
+    // autoProcessQueue() would just find those same already-done IDs again — looping
+    // synchronously forever (this actually happened: ~860 "Run started" log lines in
+    // under a second before a temp-file rename finally threw and surfaced it).
+    if (engine.autoContinueBatches && e && e.processed > 0) {
         autoProcessQueue();
     }
 });
