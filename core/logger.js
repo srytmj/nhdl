@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { atomicWriteFileSync } = require('./utils');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 // Lives inside the active download dir (a persistent volume) instead of ROOT_DIR (the
@@ -24,7 +25,7 @@ function logActivity(message) {
         const lines = content.split('\n').filter(l => l.trim() !== '');
         if (lines.length > MAX_LOG_LINES) {
             const trimmed = lines.slice(lines.length - MAX_LOG_LINES);
-            fs.writeFileSync(ACTIVITY_LOG, trimmed.join('\n') + '\n', 'utf-8');
+            atomicWriteFileSync(ACTIVITY_LOG, trimmed.join('\n') + '\n');
         }
     } catch (e) {
         // Can't write activity.log (e.g. disk went read-only) — still surface it via

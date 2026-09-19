@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { sanitizeName } = require('./utils');
+const { sanitizeName, atomicWriteFileSync } = require('./utils');
 const { buildZip } = require('./zip');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -41,7 +41,7 @@ function saveToLibrary(id, title, folder, pages, ext, pageExts = {}, extra = {},
             lang: extra.lang || null,
             downloadedAt: new Date().toISOString()
         };
-        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
 
         // Drop a tiny marker file carrying the gallery ID inside its own folder. If the
         // user later moves/renames the folder outside the app, rescanLibrary() can still
@@ -70,7 +70,7 @@ function saveArchivedToLibrary(id, title, archivePath, archiveExt, extra = {}, l
             archived: true,
             archiveExt
         };
-        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
     } catch (e) {
         console.error("Failed to save archived entry to library.json:", e.message);
     }
@@ -139,7 +139,7 @@ function rescanLibrary(baseDownloadDir, libFile = DEFAULT_LIBRARY_FILE) {
     }
 
     if (changed) {
-        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
     }
     return result;
 }
@@ -195,7 +195,7 @@ function updateListDisplayName(listPath, galleryId, displayName) {
             }
             return line;
         });
-        if (changed) fs.writeFileSync(listPath, updated.join('\n'), 'utf-8');
+        if (changed) atomicWriteFileSync(listPath, updated.join('\n'));
     } catch (e) {}
 }
 
@@ -220,7 +220,7 @@ function saveSkippedToLibrary(id, reason, libFile = DEFAULT_LIBRARY_FILE) {
     try {
         const library = loadLibrary(libFile);
         library[id] = { skipped: true, reason, skippedAt: new Date().toISOString() };
-        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
     } catch (e) {
         console.error("Failed to save skipped entry to library.json:", e.message);
     }
@@ -240,7 +240,7 @@ function logError(galleryId, message, errorLogFile = DEFAULT_ERROR_LOG) {
         const lines = content.split('\n').filter(l => l.trim() !== '');
         if (lines.length > MAX_ERROR_LOG_LINES) {
             const trimmed = lines.slice(lines.length - MAX_ERROR_LOG_LINES);
-            fs.writeFileSync(errorLogFile, trimmed.join('\n') + '\n', 'utf-8');
+            atomicWriteFileSync(errorLogFile, trimmed.join('\n') + '\n');
         }
     } catch (e) {
         // error.log itself couldn't be written (e.g. disk read-only) — fall back to
@@ -328,9 +328,9 @@ function syncListTracker(listPath, libFile = DEFAULT_LIBRARY_FILE) {
         }
     });
 
-    fs.writeFileSync(trackerFile, newStatusLines.join('\n'), 'utf-8');
+    atomicWriteFileSync(trackerFile, newStatusLines.join('\n'));
     if (listChanged) {
-        fs.writeFileSync(listPath, newListLines.join('\n'), 'utf-8');
+        atomicWriteFileSync(listPath, newListLines.join('\n'));
     }
     return { galleryIds, trackerFile };
 }
@@ -351,7 +351,7 @@ function updateListStatus(trackerFile, galleryId, newStatus) {
             }
             return line;
         });
-        fs.writeFileSync(trackerFile, updatedLines.join('\n'), 'utf-8');
+        atomicWriteFileSync(trackerFile, updatedLines.join('\n'));
     } catch (e) {}
 }
 
@@ -389,7 +389,7 @@ function renameLibraryEntry(id, newTitle, libFile = DEFAULT_LIBRARY_FILE, listFi
 
     entry.title = trimmedTitle;
     library[id] = entry;
-    fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+    atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
 
     if (listFile) {
         updateListDisplayName(listFile, id, buildDisplayName(trimmedTitle, entry.author));
@@ -460,7 +460,7 @@ function compressLibraryEntry(id, options = {}, libFile = DEFAULT_LIBRARY_FILE) 
     entry.archived = true;
     entry.archiveExt = ext;
     library[id] = entry;
-    fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+    atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
 
     return { success: true, cbzPath, pages: files.length, sizeBytes: zipBuf.length };
 }

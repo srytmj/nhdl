@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const dns = require('dns');
 
-const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, sleep, withFsRetryAsync } = require('./utils');
+const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, sleep, withFsRetryAsync, atomicWriteFileSync } = require('./utils');
 const { loadLibrary, saveToLibrary, saveArchivedToLibrary, saveSkippedToLibrary, logError, updateListStatus, isLibraryEntryValid, isPermanentlySkipped, buildDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, setStateDir } = require('./tracker');
 const { logActivity, setLogDir } = require('./logger');
 
@@ -97,7 +97,7 @@ class DownloaderEngine extends EventEmitter {
                 try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); } catch (e) {}
             }
             cfg.downloadDir = this.baseDownloadDir;
-            fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+            atomicWriteFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
             this.emit('config_updated', { downloadDir: this.baseDownloadDir });
         } catch (e) {
             console.error("Failed to save config.json:", e.message);
@@ -113,7 +113,7 @@ class DownloaderEngine extends EventEmitter {
                 try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); } catch (e) {}
             }
             cfg.downloadFormat = format;
-            fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+            atomicWriteFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
             this.emit('config_updated', { downloadFormat: format });
         } catch (e) {
             console.error("Failed to save config.json:", e.message);
@@ -128,7 +128,7 @@ class DownloaderEngine extends EventEmitter {
                 try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); } catch (e) {}
             }
             cfg.autoContinueBatches = this.autoContinueBatches;
-            fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+            atomicWriteFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
             this.emit('config_updated', { autoContinueBatches: this.autoContinueBatches });
         } catch (e) {
             console.error("Failed to save config.json:", e.message);
@@ -670,7 +670,14 @@ class DownloaderEngine extends EventEmitter {
                 result = await this.processGallery(id, i + 1, pendingIds.length, trackerFile);
             }
 
-            if (i < pendingIds.length - 1 && !this.isStopped) {
+            // A skip (already fully downloaded, per library.json/marker files) never touched
+            // the network — there's nothing to protect against getting banned for, so it
+            // shouldn't eat the same anti-ban delay/batch-rest as a real download. This is
+            // what makes reprocessing a list of mostly-already-done galleries instant instead
+            // of minutes of pure waiting.
+            const wasSkipped = !!(result && result.skipped);
+
+            if (i < pendingIds.length - 1 && !this.isStopped && !wasSkipped) {
                 if ((i + 1) % this.batchSize === 0) {
                     const currentBatch = Math.ceil((i + 1) / this.batchSize);
                     const totalSeconds = this.batchRestMinutes * 60;
