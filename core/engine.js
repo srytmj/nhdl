@@ -809,11 +809,16 @@ class DownloaderEngine extends EventEmitter {
             }
 
             // A skip (already fully downloaded, per library.json/marker files) never touched
-            // the network — there's nothing to protect against getting banned for, so it
-            // shouldn't eat the same anti-ban delay/batch-rest as a real download. This is
-            // what makes reprocessing a list of mostly-already-done galleries instant instead
-            // of minutes of pure waiting.
+            // the network, so it doesn't need the full anti-ban smart-delay/batch-rest a real
+            // download gets. But going instantly through hundreds of skips back-to-back still
+            // isn't a great look pattern-wise, so it still gets a small "humanize" pause
+            // instead of zero — a few hundred skips costs low-single-digit minutes, not the
+            // hours a full smart-delay would cost, but it's never a flat-out burst either.
             const wasSkipped = !!(result && result.skipped);
+
+            if (wasSkipped && i < pendingIds.length - 1 && !this.isStopped) {
+                await sleep(1000 + Math.floor(Math.random() * 2000));
+            }
 
             if (i < pendingIds.length - 1 && !this.isStopped && !wasSkipped) {
                 if ((i + 1) % this.batchSize === 0) {
