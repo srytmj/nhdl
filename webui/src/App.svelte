@@ -8,7 +8,7 @@
         Activity, FileDigit, Clock, Folder, FolderOpen,
         ArrowUp, RotateCcw, Check, X, HardDrive, Square, Moon,
         Library, Search, BookOpen, Pencil, Archive, PackageCheck,
-        ChevronRight, ChevronDown, ScrollText, Download, CheckSquare, LogOut
+        ChevronRight, ChevronDown, ScrollText, Download, CheckSquare, LogOut, Info
     } from 'lucide-svelte';
 
     let authRequired = false;
@@ -32,9 +32,40 @@
     let liveProgress = null;
     let engineStatus = 'IDLE';
     let confirmDelete = null;
+    let infoTooltip = null; // url of the item whose FAIL/SKIPPED reason tooltip is open
+
+    function closeInfoTooltip() {
+        infoTooltip = null;
+    }
     let extractNotice = '';
 
-    $: doneCount = items.filter(i => i.status.includes('DONE')).length;
+    // A SKIPPED item already has its file(s) on disk (already in library, or an archive we
+    // adopted) — it's just as finished as a fresh DONE, so it counts toward progress too.
+    function isFinished(status) {
+        return status.includes('DONE') || status.includes('SKIPPED');
+    }
+
+    $: doneCount = items.filter(i => isFinished(i.status)).length;
+
+    // Queue search/filter — purely a display concern, doesn't touch rawList/list.txt.
+    let queueSearch = '';
+    let queueFilter = 'all'; // all | done | active | pending | failed
+
+    function itemLabel(item) {
+        return (item.url.split('|')[1] ? item.url.split('|')[1].trim() : item.url).replace(/\+/g, ' ');
+    }
+
+    function filterItems(its) {
+        return its.filter(item => {
+            if (queueFilter === 'done' && !isFinished(item.status)) return false;
+            if (queueFilter === 'active' && !item.status.includes('ON_PROGRESS')) return false;
+            if (queueFilter === 'pending' && item.status !== 'PENDING' && item.status !== 'UNKNOWN') return false;
+            if (queueFilter === 'failed' && !(item.status.includes('ERROR') || item.status.includes('FAIL') || item.status.includes('COOLDOWN'))) return false;
+            const q = queueSearch.trim().toLowerCase();
+            if (q && !itemLabel(item).toLowerCase().includes(q) && !item.url.toLowerCase().includes(q)) return false;
+            return true;
+        });
+    }
 
     // The HUD is always rendered (never conditionally mounted/unmounted) so its entrance/exit
     // never causes a layout jump; when there's nothing live, `hud` falls back to a stable idle shape.
@@ -67,11 +98,16 @@
         return [...map.entries()].sort((a, b) => a[0] - b[0]).map(([num, its]) => ({
             num,
             items: its,
-            done: its.filter(i => i.status.includes('DONE')).length,
+            done: its.filter(i => isFinished(i.status)).length,
             total: its.length,
             collapsed: num !== activeBatchNum && manuallyCollapsed.has(num)
         }));
     })();
+
+    // Batches with at least one item matching the current search/filter — the `each` below
+    // must iterate this directly (not `batches` behind an `{#if}`) since its child uses
+    // `animate:flip`, which Svelte requires to be the sole/direct child of a keyed each.
+    $: visibleBatches = batches.filter(b => filterItems(b.items).length > 0);
 
     // Folder Picker State (Jellyfin Style)
     let downloadDir = '';
@@ -306,6 +342,14 @@
         }
     }
 
+    // Signature of the last `items` we actually applied — with large queues (hundreds of
+    // rows), reassigning `items` every 1s poll re-triggers the keyed each block's
+    // animate:flip measurement pass on every row even when nothing changed, which is what
+    // makes the UI crawl. Skipping the reassignment when the content is byte-identical
+    // avoids that entirely for the (very common) case where only 1-2 rows changed status
+    // or nothing changed at all between polls.
+    let lastItemsSignature = '';
+
     async function fetchStatus() {
         try {
             const res = await fetch('/api/status');
@@ -313,11 +357,16 @@
             // Defense in depth: dedupe by URL client-side too, so a stray duplicate can
             // never crash the keyed {#each} below regardless of what the backend sends.
             const seenUrls = new Set();
-            items = (data.items || []).filter(i => {
+            const nextItems = (data.items || []).filter(i => {
                 if (seenUrls.has(i.url)) return false;
                 seenUrls.add(i.url);
                 return true;
             });
+            const signature = nextItems.map(i => i.url + '' + i.status).join('');
+            if (signature !== lastItemsSignature) {
+                lastItemsSignature = signature;
+                items = nextItems;
+            }
             errors = data.errors;
             rawList = data.rawList;
             liveProgress = data.liveProgress;
@@ -491,7 +540,7 @@
         return result.join('\n');
     }
 
-    let insertFormat = 'folder';
+    let insertFormat = 'cbz';
 
     async function appendToList() {
         if (!newUrl.trim()) return;
@@ -550,6 +599,14 @@
         return match ? match[0] : 'Unknown';
     }
 
+    // Turns a raw status like "SKIPPED - Already in Library" / "ERROR - Cloudflare Rate
+    // Limit / Challenge (429)" into just the reason, for the info tooltip on SKIPPED/FAIL
+    // badges (the badge itself only has room for the fixed label).
+    function statusReason(status) {
+        const m = status.match(/^(?:SKIPPED|ERROR|FAIL)\s*-\s*(.+)$/i);
+        return m ? m[1].trim() : status;
+    }
+
     let confirmClearCompleted = false;
     let clearCompletedTimeout = null;
 
@@ -577,20 +634,27 @@
         saveList();
     }
 
-    let confirmClearBatch = null;
-    let clearBatchTimeout = null;
+    // Removes one batch (its header + all its items) from the queue — allowed at any
+    // point, not just once everything in it is done. Since this can throw away items
+    // that haven't downloaded yet, it always goes through a confirmation modal that
+    // states exactly how many of those there are.
+    let deleteBatchModal = null; // { num, pending, total } | null
 
-    // Removes one finished batch (its header + all its items) from the queue, once
-    // everything in it is done — no need to wait and clear the whole queue at once.
-    function clearBatch(num) {
-        if (confirmClearBatch !== num) {
-            confirmClearBatch = num;
-            clearTimeout(clearBatchTimeout);
-            clearBatchTimeout = setTimeout(() => { confirmClearBatch = null; }, 3000);
-            return;
-        }
-        clearTimeout(clearBatchTimeout);
-        confirmClearBatch = null;
+    function requestDeleteBatch(num) {
+        const batch = batches.find(b => b.num === num);
+        if (!batch) return;
+        const pending = batch.items.filter(i => !i.status.includes('DONE') && !i.status.includes('SKIPPED')).length;
+        deleteBatchModal = { num, pending, total: batch.total };
+    }
+
+    function cancelDeleteBatch() {
+        deleteBatchModal = null;
+    }
+
+    function confirmDeleteBatch() {
+        if (!deleteBatchModal) return;
+        const num = deleteBatchModal.num;
+        deleteBatchModal = null;
 
         const lines = rawList.split('\n');
         let currentBatch = 1;
@@ -681,6 +745,8 @@
         }
     }
 </script>
+
+<svelte:window on:click={closeInfoTooltip} />
 
 <main class="h-screen flex flex-col bg-[#111111] text-[#e0e0e0] font-mono selection:bg-[#333] selection:text-white overflow-hidden">
     <!-- Topbar (Fixed at top) -->
@@ -940,6 +1006,26 @@
                         <div class="h-1 w-full bg-[#0a0a0a] rounded-full overflow-hidden" transition:slide={{ duration: 200 }}>
                             <div class="h-full bg-lime-400 transition-all duration-300" style="width: {(doneCount / items.length) * 100}%"></div>
                         </div>
+                        <div class="flex items-center gap-1.5">
+                            <div class="relative flex-1">
+                                <Search size={12} class="absolute left-2 top-1/2 -translate-y-1/2 text-gray-600 pointer-events-none" />
+                                <input
+                                    type="text"
+                                    bind:value={queueSearch}
+                                    placeholder="Search queue by title or ID..."
+                                    class="w-full bg-[#0a0a0a] border border-[#2a2a2a] text-[11px] text-gray-300 py-1 pl-6 pr-2 rounded-sm focus:outline-none focus:border-white transition-colors" />
+                            </div>
+                            <select
+                                bind:value={queueFilter}
+                                title="Filter queue by status"
+                                class="bg-[#0a0a0a] border border-[#2a2a2a] text-[11px] text-gray-300 py-1 pl-2 pr-1 rounded-sm focus:outline-none focus:border-white transition-colors font-sans shrink-0">
+                                <option value="all">All Status</option>
+                                <option value="done">Done / Skipped</option>
+                                <option value="active">Active</option>
+                                <option value="pending">Pending</option>
+                                <option value="failed">Failed / Cooldown</option>
+                            </select>
+                        </div>
                     {/if}
                 </div>
 
@@ -949,9 +1035,13 @@
                         <div class="py-16 text-center text-gray-600 text-xs border border-dashed border-[#222] rounded-sm" transition:fade={{ duration: 200 }}>
                             NO TASKS IN QUEUE
                         </div>
+                    {:else if batches.every(b => filterItems(b.items).length === 0)}
+                        <div class="py-16 text-center text-gray-600 text-xs border border-dashed border-[#222] rounded-sm" transition:fade={{ duration: 200 }}>
+                            NO MATCHES FOR THIS SEARCH/FILTER
+                        </div>
                     {/if}
 
-                    {#each batches as batch (batch.num)}
+                    {#each visibleBatches as batch (batch.num)}
                         <div class="space-y-2" animate:flip={{ duration: 250 }}>
                             <div class="w-full flex items-center justify-between px-2.5 py-1.5 bg-[#171717] hover:bg-[#1c1c1c] border border-[#262626] rounded-sm transition-colors">
                                 <button
@@ -968,41 +1058,63 @@
                                     {/if}
                                 </button>
                                 <div class="flex items-center gap-2 shrink-0">
-                                    {#if batch.done === batch.total && batch.total > 0}
-                                        <button
-                                            on:click={() => clearBatch(batch.num)}
-                                            transition:fade={{ duration: 120 }}
-                                            class="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border transition-colors {confirmClearBatch === batch.num ? 'bg-white text-black border-white font-bold' : 'bg-transparent text-gray-500 border-[#333] hover:text-white hover:border-[#555]'}"
-                                            title="Remove this finished batch from the queue">
-                                            <Trash2 size={11} />
-                                            <span>{confirmClearBatch === batch.num ? 'Confirm?' : 'Clear'}</span>
-                                        </button>
-                                    {/if}
+                                    <button
+                                        on:click={() => requestDeleteBatch(batch.num)}
+                                        class="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border bg-transparent text-gray-500 border-[#333] hover:text-red-400 hover:border-red-400/50 transition-colors"
+                                        title="Remove this batch from the queue">
+                                        <Trash2 size={11} />
+                                        <span>Delete</span>
+                                    </button>
                                     <span class="text-[10px] text-gray-500 font-sans">{batch.done} / {batch.total} done</span>
                                 </div>
                             </div>
 
                             {#if !batch.collapsed}
                                 <div class="space-y-2 pl-2" transition:slide={{ duration: 200 }}>
-                                    {#each batch.items as item (item.url)}
+                                    {#each filterItems(batch.items) as item (item.url)}
                                         <div
                                             class="group flex items-center justify-between bg-[#141414] border p-3 rounded-sm transition-colors {item.status.includes('DONE') ? 'border-lime-400/30 border-l-2 border-l-lime-400' : 'border-[#222] hover:border-[#383838]'}"
                                             in:fade={{ duration: 200 }}
-                                            out:slide={{ duration: 200 }}
-                                            animate:flip={{ duration: 250 }}>
+                                            out:slide={{ duration: 200 }}>
                                             <div class="flex items-center space-x-3 overflow-hidden min-w-0 mr-2">
                                                 {#if item.status.includes('DONE')}
                                                     <span class="text-[11px] px-2 py-0.5 bg-lime-400 text-black border border-lime-400 font-bold rounded-sm w-20 text-center shrink-0 flex items-center justify-center gap-1" in:scale={{ duration: 200, start: 0.8 }}>
                                                         <Check size={11} strokeWidth={3} /> DONE
                                                     </span>
                                                 {:else if item.status.includes('ERROR') || item.status.includes('FAIL')}
-                                                    <span class="text-[11px] px-2 py-0.5 bg-white text-black border border-white font-bold rounded-sm w-20 text-center shrink-0" in:scale={{ duration: 200, start: 0.8 }}>FAIL</span>
+                                                    <span class="relative flex items-center gap-1 text-[11px] px-2 py-0.5 bg-white text-black border border-white font-bold rounded-sm w-20 justify-center shrink-0" in:scale={{ duration: 200, start: 0.8 }}>
+                                                        FAIL
+                                                        <button
+                                                            type="button"
+                                                            on:click|stopPropagation={() => infoTooltip = infoTooltip === item.url ? null : item.url}
+                                                            class="shrink-0 flex items-center">
+                                                            <Info size={11} />
+                                                        </button>
+                                                        {#if infoTooltip === item.url}
+                                                            <span class="absolute left-0 top-full mt-1 z-10 w-max max-w-[260px] text-[10px] font-normal normal-case text-gray-200 bg-[#0d0d0d] border border-[#333] rounded-sm px-2 py-1.5 shadow-xl" transition:fade={{ duration: 100 }}>
+                                                                {statusReason(item.status)}
+                                                            </span>
+                                                        {/if}
+                                                    </span>
                                                 {:else if item.status.includes('COOLDOWN')}
                                                     <span class="text-[11px] px-2 py-0.5 bg-transparent text-gray-300 border border-dashed border-gray-500 rounded-sm w-20 text-center shrink-0" in:fade={{ duration: 150 }}>PAUSED</span>
                                                 {:else if item.status.includes('ON_PROGRESS')}
                                                     <span class="text-[11px] px-2 py-0.5 bg-lime-400/15 text-lime-400 border border-lime-400/40 rounded-sm w-20 text-center shrink-0 animate-pulse" in:fade={{ duration: 150 }}>ACTIVE</span>
                                                 {:else if item.status.includes('SKIPPED')}
-                                                    <span class="text-[11px] px-2 py-0.5 bg-gray-800/40 text-gray-500 border border-gray-700/40 rounded-sm w-20 text-center shrink-0" in:fade={{ duration: 150 }}>SKIPPED</span>
+                                                    <span class="relative flex items-center gap-1 text-[11px] px-2 py-0.5 bg-gray-800/40 text-gray-500 border border-gray-700/40 rounded-sm w-20 justify-center shrink-0" in:fade={{ duration: 150 }}>
+                                                        SKIPPED
+                                                        <button
+                                                            type="button"
+                                                            on:click|stopPropagation={() => infoTooltip = infoTooltip === item.url ? null : item.url}
+                                                            class="shrink-0 flex items-center">
+                                                            <Info size={11} />
+                                                        </button>
+                                                        {#if infoTooltip === item.url}
+                                                            <span class="absolute left-0 top-full mt-1 z-10 w-max max-w-[260px] text-[10px] font-normal normal-case text-gray-200 bg-[#0d0d0d] border border-[#333] rounded-sm px-2 py-1.5 shadow-xl" transition:fade={{ duration: 100 }}>
+                                                                {statusReason(item.status)}
+                                                            </span>
+                                                        {/if}
+                                                    </span>
                                                 {:else}
                                                     <span class="text-[11px] px-2 py-0.5 bg-[#1e1e1e] text-gray-400 border border-[#2a2a2a] rounded-sm w-20 text-center shrink-0" in:fade={{ duration: 150 }}>PENDING</span>
                                                 {/if}
@@ -1257,6 +1369,42 @@
                             <span>SELECT THIS FOLDER</span>
                         </button>
                     </div>
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    <!-- DELETE BATCH CONFIRMATION MODAL -->
+    {#if deleteBatchModal}
+        <div class="fixed inset-0 bg-black/80 backdrop-blur-xs z-50 flex items-center justify-center p-4" transition:fade={{ duration: 150 }}>
+            <div class="bg-[#151515] border border-[#333] rounded-md max-w-sm w-full shadow-2xl overflow-hidden" transition:scale={{ duration: 180, start: 0.95 }}>
+                <div class="border-b border-[#262626] bg-[#0d0d0d] px-5 py-3.5 flex items-center space-x-2">
+                    <Trash2 size={16} class="text-red-400" />
+                    <h2 class="text-sm font-semibold tracking-wider text-white uppercase">Delete Batch {deleteBatchModal.num}?</h2>
+                </div>
+                <div class="px-5 py-4 space-y-2">
+                    {#if deleteBatchModal.pending > 0}
+                        <p class="text-xs text-gray-300">
+                            <span class="text-red-400 font-bold">{deleteBatchModal.pending}</span> of {deleteBatchModal.total} item(s) in this batch
+                            <span class="font-bold">have not finished downloading</span>. Deleting removes them from the queue for good —
+                            they will not be downloaded unless you paste them back in.
+                        </p>
+                    {:else}
+                        <p class="text-xs text-gray-300">All {deleteBatchModal.total} item(s) in this batch are already done. This just removes them from the queue view.</p>
+                    {/if}
+                    <p class="text-[11px] text-gray-500">This does not touch anything already downloaded.</p>
+                </div>
+                <div class="px-5 py-3.5 bg-[#0d0d0d] border-t border-[#262626] flex items-center justify-end gap-2">
+                    <button
+                        on:click={cancelDeleteBatch}
+                        class="text-[11px] px-3 py-1.5 rounded border bg-transparent text-gray-400 border-[#333] hover:text-white hover:border-[#555] transition-colors">
+                        Cancel
+                    </button>
+                    <button
+                        on:click={confirmDeleteBatch}
+                        class="text-[11px] px-3 py-1.5 rounded border bg-red-500/10 text-red-400 border-red-400/40 hover:bg-red-500/20 font-bold transition-colors">
+                        {deleteBatchModal.pending > 0 ? `Delete ${deleteBatchModal.total} item(s) anyway` : `Delete ${deleteBatchModal.total} item(s)`}
+                    </button>
                 </div>
             </div>
         </div>
