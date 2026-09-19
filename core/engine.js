@@ -424,7 +424,8 @@ class DownloaderEngine extends EventEmitter {
                     updateListDisplayName(trackerFileToListPath(trackerFile), galleryId, buildDisplayName(data.title, data.author));
                 }
                 this.emit('skipped', { galleryId, title: data.title, currentTaskNum, totalTasks, reason: 'Already in Library' });
-                return { status: "SUCCESS", numPages: data.pages, skipped: true };
+                // Pure library.json lookup — zero network requests made, nothing to pace.
+                return { status: "SUCCESS", numPages: data.pages, skipped: true, skipReason: 'library' };
             }
         }
 
@@ -450,7 +451,9 @@ class DownloaderEngine extends EventEmitter {
                     }
                     logActivity(`SKIPPED ID ${galleryId}: found existing file on disk, avoided 429 cooldown`);
                     this.emit('skipped', { galleryId, title: found.title, currentTaskNum, totalTasks, reason: 'Already on disk (metadata blocked by 429)' });
-                    return { status: "SUCCESS", numPages: found.pages || 0, skipped: true };
+                    // The metadata request itself already got a 429 (blocked, no data) — no
+                    // successful request was made here, so there's nothing extra to pace.
+                    return { status: "SUCCESS", numPages: found.pages || 0, skipped: true, skipReason: 'library' };
                 }
             }
             logError(galleryId, "Cloudflare Rate Limit / Challenge (429)");
@@ -498,7 +501,9 @@ class DownloaderEngine extends EventEmitter {
                         updateListDisplayName(trackerFileToListPath(trackerFile), galleryId, buildDisplayName(title, authorStr));
                     }
                     this.emit('skipped', { galleryId, title, currentTaskNum, totalTasks, reason: 'Already Downloaded (Archive)' });
-                    return { status: "SUCCESS", numPages, skipped: true };
+                    // A real metadata request to nhentai just happened (that's how we got
+                    // `title` to match against) — pace this like a real hit, not a free skip.
+                    return { status: "SUCCESS", numPages, skipped: true, skipReason: 'disk_after_metadata' };
                 }
 
                 // Otherwise, an existing folder with this same title (exact, or the on-disk
@@ -547,7 +552,8 @@ class DownloaderEngine extends EventEmitter {
             this.maybeCompress(galleryId, trackerFile);
             if (trackerFile) updateListStatus(trackerFile, galleryId, "SKIPPED - Files Complete");
             this.emit('skipped', { galleryId, title, currentTaskNum, totalTasks, reason: 'Files 100% Complete' });
-            return { status: "SUCCESS", numPages, skipped: true };
+            // Same as above — a real metadata request already happened this call.
+            return { status: "SUCCESS", numPages, skipped: true, skipReason: 'disk_after_metadata' };
         }
 
         await new Promise((resolve) => {
@@ -808,19 +814,20 @@ class DownloaderEngine extends EventEmitter {
                 this.consecutiveRateLimits = 0;
             }
 
-            // A skip (already fully downloaded, per library.json/marker files) never touched
-            // the network, so it doesn't need the full anti-ban smart-delay/batch-rest a real
-            // download gets. But going instantly through hundreds of skips back-to-back still
-            // isn't a great look pattern-wise, so it still gets a small "humanize" pause
-            // instead of zero — a few hundred skips costs low-single-digit minutes, not the
-            // hours a full smart-delay would cost, but it's never a flat-out burst either.
-            const wasSkipped = !!(result && result.skipped);
+            // Only a pure library.json/marker-file hit never touched the network at all — that
+            // one gets a small "humanize" pause instead of the full anti-ban delay (a few
+            // hundred of these costs low-single-digit minutes instead of hours, but it's never
+            // a flat-out instant burst either). Any OTHER skip reason (found on disk only
+            // after a real metadata fetch succeeded) DID make a real request to nhentai just
+            // now and needs the same pacing a real download gets — it just skips the actual
+            // page downloads afterward.
+            const wasFreeSkip = !!(result && result.skipped && result.skipReason === 'library');
 
-            if (wasSkipped && i < pendingIds.length - 1 && !this.isStopped) {
+            if (wasFreeSkip && i < pendingIds.length - 1 && !this.isStopped) {
                 await sleep(1000 + Math.floor(Math.random() * 2000));
             }
 
-            if (i < pendingIds.length - 1 && !this.isStopped && !wasSkipped) {
+            if (i < pendingIds.length - 1 && !this.isStopped && !wasFreeSkip) {
                 if ((i + 1) % this.batchSize === 0) {
                     const currentBatch = Math.ceil((i + 1) / this.batchSize);
                     const totalSeconds = this.batchRestMinutes * 60;
