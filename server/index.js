@@ -107,7 +107,9 @@ function autoProcessQueue() {
         const synced = syncListTracker(getListFile());
         if (synced && synced.galleryIds.length > 0 && !engine.isRunning) {
             console.log(`[+] Auto-processing queue: ${synced.galleryIds.length} galleries found.`);
-            engine.runBatch(synced.galleryIds, synced.trackerFile);
+            engine.runBatch(synced.galleryIds, synced.trackerFile).catch(e => {
+                logActivity(`FATAL runBatch (auto-process): ${e.stack || e.message}`);
+            });
         }
     }
 }
@@ -314,7 +316,9 @@ const server = http.createServer((req, res) => {
                         res.end(JSON.stringify({ success: true }));
 
                         if (synced && synced.galleryIds.length > 0 && !engine.isRunning && !engine.isPaused) {
-                            engine.runBatch(synced.galleryIds, synced.trackerFile);
+                            engine.runBatch(synced.galleryIds, synced.trackerFile).catch(e => {
+                                logActivity(`FATAL runBatch (queue save): ${e.stack || e.message}`);
+                            });
                         }
                     } else {
                         res.writeHead(400);

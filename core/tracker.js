@@ -170,7 +170,7 @@ function rescanLibrary(baseDownloadDir, libFile = DEFAULT_LIBRARY_FILE) {
     }
 
     if (changed) {
-        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
+        try { atomicWriteFileSync(libFile, JSON.stringify(library, null, 2)); } catch (e) {}
     }
     return result;
 }
@@ -384,9 +384,15 @@ function syncListTracker(listPath, libFile = DEFAULT_LIBRARY_FILE) {
         }
     });
 
-    atomicWriteFileSync(trackerFile, newStatusLines.join('\n'));
+    // Best-effort, like every other tracker write in this file (updateListStatus, the
+    // library.json marker drops, etc): a transient lock (Windows Defender/indexer holding
+    // the file for a moment — common enough to have caused a real unhandled-rejection crash
+    // once already) shouldn't stop this function from returning galleryIds/trackerFile to
+    // its caller. Worst case the on-disk file just isn't refreshed this one call; it
+    // self-heals on the next successful sync.
+    try { atomicWriteFileSync(trackerFile, newStatusLines.join('\n')); } catch (e) {}
     if (listChanged) {
-        atomicWriteFileSync(listPath, newListLines.join('\n'));
+        try { atomicWriteFileSync(listPath, newListLines.join('\n')); } catch (e) {}
     }
     return { galleryIds, trackerFile };
 }

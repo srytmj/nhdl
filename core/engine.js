@@ -813,7 +813,18 @@ class DownloaderEngine extends EventEmitter {
         if (this.isRunning) return;
         this.isRunning = true;
         this.isStopped = false;
+        // Everything below is wrapped so isRunning is *guaranteed* to reset even if
+        // something throws mid-batch — without this, an uncaught error anywhere in here
+        // leaves isRunning stuck at true forever, and the app can never START again
+        // (every entry point gates on !isRunning) short of a manual restart.
+        try {
+            await this._runBatchBody(galleryIds, trackerFile);
+        } finally {
+            this.isRunning = false;
+        }
+    }
 
+    async _runBatchBody(galleryIds, trackerFile) {
         const library = loadLibrary();
         const uniqueIds = [...new Set(galleryIds)];
         const pendingIds = uniqueIds.filter(id => !isLibraryEntryValid(library[id]) && !isPermanentlySkipped(library[id]));
@@ -822,7 +833,6 @@ class DownloaderEngine extends EventEmitter {
         logActivity(`Run started: ${pendingIds.length} pending / ${uniqueIds.length} total (${uniqueIds.length - pendingIds.length} already in library)`);
 
         if (pendingIds.length === 0) {
-            this.isRunning = false;
             this.emit('batch_complete', { processed: 0 });
             return;
         }
@@ -1001,7 +1011,6 @@ class DownloaderEngine extends EventEmitter {
             }
         }
 
-        this.isRunning = false;
         logActivity(`Run finished: ${pendingIds.length} galleries processed`);
         this.emit('batch_complete', { processed: pendingIds.length });
     }
