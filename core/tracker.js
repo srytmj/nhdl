@@ -8,11 +8,13 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 // container's writable layer, wiped on every image rebuild) — see setStateDir().
 let DEFAULT_LIBRARY_FILE = path.join(ROOT_DIR, 'library.json');
 let DEFAULT_ERROR_LOG = path.join(ROOT_DIR, 'error.log');
+let DEFAULT_PLACEHOLDER_LOG = path.join(ROOT_DIR, 'placeholder_pages.log');
 
 function setStateDir(dir) {
     if (!dir) return;
     DEFAULT_LIBRARY_FILE = path.join(dir, 'library.json');
     DEFAULT_ERROR_LOG = path.join(dir, 'error.log');
+    DEFAULT_PLACEHOLDER_LOG = path.join(dir, 'placeholder_pages.log');
 }
 
 function loadLibrary(libFile = DEFAULT_LIBRARY_FILE) {
@@ -283,6 +285,20 @@ function saveSkippedToLibrary(id, reason, libFile = DEFAULT_LIBRARY_FILE) {
 }
 
 const MAX_ERROR_LOG_LINES = 200;
+
+// Pages substituted with a generated blank image because the CDN kept serving a tiny
+// placeholder instead of real content (see PLACEHOLDER_RETRY_THRESHOLD in engine.js) — kept
+// in its own log (not error.log) so it's easy to scan later and try re-downloading just
+// these specific pages once the block/fingerprint situation changes.
+function logPlaceholderPage(galleryId, page, title, placeholderLogFile = DEFAULT_PLACEHOLDER_LOG) {
+    const time = new Date().toISOString();
+    const logLine = `[${time}] ID: ${galleryId} ("${title}") - page ${page} substituted with a blank image (CDN served placeholder)`;
+    try {
+        fs.appendFileSync(placeholderLogFile, logLine + '\n', 'utf-8');
+    } catch (e) {
+        console.error(`${logLine} [placeholder_pages.log write failed: ${e.code || e.message}]`);
+    }
+}
 
 function logError(galleryId, message, errorLogFile = DEFAULT_ERROR_LOG) {
     const time = new Date().toISOString();
@@ -576,6 +592,8 @@ module.exports = {
     saveArchivedToLibrary,
     saveSkippedToLibrary,
     logError,
+    logPlaceholderPage,
+    get DEFAULT_PLACEHOLDER_LOG() { return DEFAULT_PLACEHOLDER_LOG; },
     syncListTracker,
     updateListStatus,
     isLibraryEntryValid,

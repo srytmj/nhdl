@@ -7,13 +7,20 @@ const fs = require('fs');
 const path = require('path');
 const dns = require('dns');
 
-const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, sleep, withFsRetryAsync, atomicWriteFileSync } = require('./utils');
-const { loadLibrary, saveToLibrary, saveArchivedToLibrary, saveSkippedToLibrary, logError, updateListStatus, isLibraryEntryValid, isPermanentlySkipped, buildDisplayName, getCachedDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, setStateDir, uniqueArchivePath, saveArchivedGallery } = require('./tracker');
+const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, writeBlankPlaceholderImage, sleep, withFsRetryAsync, atomicWriteFileSync } = require('./utils');
+const { loadLibrary, saveToLibrary, saveArchivedToLibrary, saveSkippedToLibrary, logError, logPlaceholderPage, updateListStatus, isLibraryEntryValid, isPermanentlySkipped, buildDisplayName, getCachedDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, setStateDir, uniqueArchivePath, saveArchivedGallery } = require('./tracker');
 const { logActivity, setLogDir } = require('./logger');
 const { fetchGalleryMetadata, requestDownloadUrl, downloadArchiveFile } = require('./nhentaiApi');
 
 dns.setServers(['1.1.1.1', '8.8.8.8']);
 const NHENTAI_MAIN_IP = '104.26.4.188';
+
+// A page that keeps failing verification AND keeps coming back suspiciously small (well
+// under any real manga page, which is always tens/hundreds of KB) isn't a transient
+// network blip after this many attempts — it's the CDN deliberately serving a blank
+// placeholder to this IP instead of real content. Retrying that forever just spins.
+const PLACEHOLDER_RETRY_THRESHOLD = 5;
+const PLACEHOLDER_SIZE_CEILING = 1536;
 
 const CONFIG_FILE = path.join(__dirname, '..', 'config.json');
 
@@ -770,9 +777,28 @@ class DownloaderEngine extends EventEmitter {
                         }))
                         .then(() => {
                             if (!verifyImage(destPath)) {
-                                pageRetryCounts.set(currentPage, retryCount + 1);
-                                pageErrors.set(currentPage, 'Downloaded file failed verification (corrupt/too small)');
-                                pendingPages.unshift(currentPage);
+                                const attempt = retryCount + 1;
+                                let failedSize = 0;
+                                try { failedSize = fs.statSync(destPath).size; } catch (e) {}
+
+                                if (attempt >= PLACEHOLDER_RETRY_THRESHOLD && failedSize > 0 && failedSize < PLACEHOLDER_SIZE_CEILING) {
+                                    if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+                                    writeBlankPlaceholderImage(destPath);
+                                    logPlaceholderPage(galleryId, currentPage, title);
+                                    logActivity(`[PLACEHOLDER] ID ${galleryId} page ${currentPage}: CDN served a blank image ${attempt}x in a row - substituted a blank page instead of retrying forever`);
+                                    pageRetryCounts.delete(currentPage);
+                                    pageErrors.delete(currentPage);
+                                    completedBytes += failedSize;
+                                    completed++;
+                                    const percent = Math.round((completed / numPages) * 100);
+                                    this.currentProgress = buildProgress();
+                                    this.currentProgress.percent = percent;
+                                    this.emit('progress', this.currentProgress);
+                                } else {
+                                    pageRetryCounts.set(currentPage, attempt);
+                                    pageErrors.set(currentPage, 'Downloaded file failed verification (corrupt/too small)');
+                                    pendingPages.unshift(currentPage);
+                                }
                             } else {
                                 pageRetryCounts.delete(currentPage);
                                 pageErrors.delete(currentPage);
