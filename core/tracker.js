@@ -20,6 +20,15 @@ function loadLibrary(libFile = DEFAULT_LIBRARY_FILE) {
 
 const MARKER_FILENAME = '.nhdl-id';
 
+// Archives (.cbz/.zip) are a single file, not a folder — there's nowhere inside them to
+// drop MARKER_FILENAME the way loose-folder galleries get one, and we have no zip-editing
+// capability to inject an entry into an already-built archive. So archives get a sidecar
+// marker file next to them instead: "Title.cbz" -> "Title.cbz.nhdl-id". Same purpose (let
+// rescanLibrary relink/dedupe after library.json is lost or the file gets moved).
+function archiveMarkerPath(archivePath) {
+    return archivePath + MARKER_FILENAME;
+}
+
 function saveToLibrary(id, title, folder, pages, ext, pageExts = {}, extra = {}, libFile = DEFAULT_LIBRARY_FILE) {
     try {
         const library = loadLibrary(libFile);

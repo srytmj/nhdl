@@ -328,7 +328,7 @@
         }
     }
 
-    let downloadFormat = 'folder';
+    let downloadFormat = 'cbz';
     let autoContinueBatches = true;
 
     // nhentai v2 API key — stored server-side in .env (survives restarts), never
@@ -551,7 +551,7 @@
         return result.join('\n');
     }
 
-    let insertFormat = 'folder';
+    let insertFormat = 'cbz';
 
     async function appendToList() {
         if (!newUrl.trim()) return;

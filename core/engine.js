@@ -37,13 +37,13 @@ class DownloaderEngine extends EventEmitter {
     constructor(options = {}) {
         super();
         let savedDownloadDir = null;
-        let savedDownloadFormat = 'folder';
+        let savedDownloadFormat = 'cbz';
         let savedAutoContinue = true;
         if (fs.existsSync(CONFIG_FILE)) {
             try {
                 const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
                 if (cfg.downloadDir) savedDownloadDir = cfg.downloadDir;
-                if (cfg.downloadFormat === 'cbz') savedDownloadFormat = 'cbz';
+                if (cfg.downloadFormat === 'folder' || cfg.downloadFormat === 'zip' || cfg.downloadFormat === 'cbz') savedDownloadFormat = cfg.downloadFormat;
                 if (cfg.autoContinueBatches === false) savedAutoContinue = false;
             } catch (e) {}
         }
@@ -280,7 +280,7 @@ class DownloaderEngine extends EventEmitter {
             };
         }
         if (apiResult.notFound) throw new Error("404 Page (Gallery not found / already removed)");
-        logActivity(`API metadata failed for ID ${galleryId}, falling back to HTML scrape: ${apiResult.reason}`);
+        logActivity(`[METADATA] ID ${galleryId}: API failed (${apiResult.reason}) — using HTML scrape instead`);
         return this.fetchMetadataViaHtml(galleryId);
     }
 
@@ -367,9 +367,18 @@ class DownloaderEngine extends EventEmitter {
     async tryApiArchiveDownload(galleryId, format, apiKey, ctx) {
         const { sanitizedTitle, title, folderPath, numPages, authorStr, langStr, extraMeta, currentTaskNum, totalTasks, trackerFile } = ctx;
 
+        const baseProgress = {
+            galleryId, title: title.substring(0, 40), percent: 0, completed: 0, total: 1,
+            taskNum: currentTaskNum, totalTasks, activePages: [], speedKBps: 0,
+            stalled: false, stalledSeconds: 0, live: true
+        };
+        this.currentProgress = { ...baseProgress, message: 'Requesting API download URL...' };
+        this.emit('progress', this.currentProgress);
+
         const urlResult = await requestDownloadUrl(galleryId, format, apiKey);
         if (!urlResult.success) {
-            logActivity(`API download skipped for ID ${galleryId}, falling back to CDN: ${urlResult.reason}`);
+            logActivity(`[API] ID ${galleryId}: couldn't get download URL (${urlResult.reason}) — falling back to CDN`);
+            this.currentProgress = null;
             return null;
         }
 
@@ -377,16 +386,20 @@ class DownloaderEngine extends EventEmitter {
         if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
         const archivePath = uniqueArchivePath(parentDir, sanitizedTitle, format);
 
+        this.currentProgress = { ...baseProgress, message: 'Downloading archive via API...' };
+        this.emit('progress', this.currentProgress);
+
         const dlResult = await downloadArchiveFile(urlResult.url, archivePath);
         if (!dlResult.success) {
-            logActivity(`API download failed for ID ${galleryId}, falling back to CDN: ${dlResult.reason}`);
+            logActivity(`[API] ID ${galleryId}: archive download failed (${dlResult.reason}) — falling back to CDN`);
             if (fs.existsSync(archivePath)) { try { fs.unlinkSync(archivePath); } catch (e) {} }
+            this.currentProgress = null;
             return null;
         }
 
         saveArchivedGallery(galleryId, sanitizedTitle, archivePath, format, { author: authorStr, lang: langStr, pages: numPages, extraMeta });
         if (trackerFile) updateListStatus(trackerFile, galleryId, "DONE");
-        logActivity(`DONE ID ${galleryId}: "${title}" (${numPages} pages, via API)`);
+        logActivity(`[API] DONE ID ${galleryId}: "${title}" (${numPages} pages)`);
         this.currentProgress = null;
         this.emit('done', { galleryId, title, pages: numPages, currentTaskNum, totalTasks });
         return { status: "SUCCESS", numPages };
@@ -546,7 +559,7 @@ class DownloaderEngine extends EventEmitter {
                     saveToLibrary(galleryId, sanitizedTitle, folderPath, numPages, ext, pageExts, { author: authorStr, lang: langStr, extraMeta });
                     this.maybeCompress(galleryId, trackerFile);
                     if (trackerFile) updateListStatus(trackerFile, galleryId, "DONE");
-                    logActivity(`DONE ID ${galleryId}: "${title}" (${numPages} pages)`);
+                    logActivity(`[CDN] DONE ID ${galleryId}: "${title}" (${numPages} pages)`);
                     this.currentProgress = null;
                     this.emit('done', { galleryId, title, pages: numPages, currentTaskNum, totalTasks });
                     return resolve();
