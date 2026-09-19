@@ -208,6 +208,24 @@ function isLibraryEntryValid(entry) {
     return !!(entry && entry.folder && fs.existsSync(entry.folder));
 }
 
+// A gallery whose link is permanently unusable (404, removed, blocked page we can't parse)
+// gets marked here instead of a real download entry — isLibraryEntryValid() stays false for
+// it (there's no folder/content), but isPermanentlySkipped() lets runBatch exclude it from
+// pendingIds so it's not retried forever on every future run.
+function isPermanentlySkipped(entry) {
+    return !!(entry && entry.skipped === true);
+}
+
+function saveSkippedToLibrary(id, reason, libFile = DEFAULT_LIBRARY_FILE) {
+    try {
+        const library = loadLibrary(libFile);
+        library[id] = { skipped: true, reason, skippedAt: new Date().toISOString() };
+        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+    } catch (e) {
+        console.error("Failed to save skipped entry to library.json:", e.message);
+    }
+}
+
 const MAX_ERROR_LOG_LINES = 200;
 
 function logError(galleryId, message, errorLogFile = DEFAULT_ERROR_LOG) {
@@ -454,10 +472,12 @@ module.exports = {
     loadLibrary,
     saveToLibrary,
     saveArchivedToLibrary,
+    saveSkippedToLibrary,
     logError,
     syncListTracker,
     updateListStatus,
     isLibraryEntryValid,
+    isPermanentlySkipped,
     buildDisplayName,
     updateListDisplayName,
     trackerFileToListPath,

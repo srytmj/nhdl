@@ -8,7 +8,7 @@ const path = require('path');
 const dns = require('dns');
 
 const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, sleep, withFsRetryAsync } = require('./utils');
-const { loadLibrary, saveToLibrary, saveArchivedToLibrary, logError, updateListStatus, isLibraryEntryValid, buildDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, setStateDir } = require('./tracker');
+const { loadLibrary, saveToLibrary, saveArchivedToLibrary, saveSkippedToLibrary, logError, updateListStatus, isLibraryEntryValid, isPermanentlySkipped, buildDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, setStateDir } = require('./tracker');
 const { logActivity, setLogDir } = require('./logger');
 
 dns.setServers(['1.1.1.1', '8.8.8.8']);
@@ -269,7 +269,11 @@ class DownloaderEngine extends EventEmitter {
             html.includes("Rate limit exceeded") || html.includes("Attention Required! | Cloudflare")) {
             return { status: "RATE_LIMIT" };
         } else if (titleMatch && titleMatch[1].includes("404")) {
-            throw new Error("404 Page (Gallery not found / already removed)");
+            const e = new Error("Link tidak dapat diakses (404 - gallery not found / sudah dihapus)");
+            e.permanent = true;
+            throw e;
+        } else if (!html || html.trim().length === 0) {
+            throw new Error("Empty response (network issue, not a broken link)");
         }
 
         if (metaTitleMatch) title = metaTitleMatch[1];
@@ -593,7 +597,7 @@ class DownloaderEngine extends EventEmitter {
 
         const library = loadLibrary();
         const uniqueIds = [...new Set(galleryIds)];
-        const pendingIds = uniqueIds.filter(id => !isLibraryEntryValid(library[id]));
+        const pendingIds = uniqueIds.filter(id => !isLibraryEntryValid(library[id]) && !isPermanentlySkipped(library[id]));
 
         this.emit('batch_start', { total: uniqueIds.length, pending: pendingIds.length, skipped: uniqueIds.length - pendingIds.length });
         logActivity(`Run started: ${pendingIds.length} pending / ${uniqueIds.length} total (${uniqueIds.length - pendingIds.length} already in library)`);
@@ -616,10 +620,20 @@ class DownloaderEngine extends EventEmitter {
             try {
                 result = await this.processGallery(id, i + 1, pendingIds.length, trackerFile);
             } catch (err) {
-                logError(id, err.message);
-                logActivity(`ERROR ID ${id}: ${err.message}`);
-                if (trackerFile) updateListStatus(trackerFile, id, `ERROR - ${err.message.substring(0, 30)}`);
-                this.emit('error', { galleryId: id, error: err.message, currentTaskNum: i + 1, totalTasks: pendingIds.length });
+                if (err.permanent) {
+                    // A genuinely broken/wrong link (e.g. 404 - gallery removed or never
+                    // existed) — mark it skipped-for-good instead of erroring every single
+                    // run forever, and keep the batch moving to the next gallery.
+                    saveSkippedToLibrary(id, err.message);
+                    logActivity(`SKIPPED ID ${id}: ${err.message}`);
+                    if (trackerFile) updateListStatus(trackerFile, id, `SKIPPED - ${err.message.substring(0, 60)}`);
+                    this.emit('skipped', { galleryId: id, reason: err.message, currentTaskNum: i + 1, totalTasks: pendingIds.length });
+                } else {
+                    logError(id, err.message);
+                    logActivity(`ERROR ID ${id}: ${err.message}`);
+                    if (trackerFile) updateListStatus(trackerFile, id, `ERROR - ${err.message.substring(0, 30)}`);
+                    this.emit('error', { galleryId: id, error: err.message, currentTaskNum: i + 1, totalTasks: pendingIds.length });
+                }
             }
 
             // Cloudflare 429 Cooldown loop
