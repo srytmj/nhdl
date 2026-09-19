@@ -9,19 +9,33 @@ loadEnvFile(ROOT_DIR);
 const { verifyApiKey } = require('../core/nhentaiApi');
 
 const DownloaderEngine = require('../core/engine');
-const { DEFAULT_ERROR_LOG, syncListTracker, updateListStatus, loadLibrary, rescanLibrary, renameLibraryEntry, compressLibraryEntry } = require('../core/tracker');
+const trackerModule = require('../core/tracker');
+const { syncListTracker, updateListStatus, loadLibrary, rescanLibrary, renameLibraryEntry, compressLibraryEntry } = trackerModule;
 const { extractGalleries } = require('../core/utils');
 const { logActivity, readActivityLog, ACTIVITY_LOG } = require('../core/logger');
 const { isAuthRequired, checkPassword, createSession, isValidSession, destroySession, parseCookies, SESSION_TTL_MS } = require('../core/auth');
 
-const LIST_FILE = path.join(ROOT_DIR, 'list.txt');
-const STATUS_FILE = path.join(ROOT_DIR, 'list_status.txt');
 const WEBUI_DIST = path.join(ROOT_DIR, 'webui', 'dist');
 
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 const SESSION_COOKIE = 'nhdl_session';
 
 const engine = new DownloaderEngine();
+
+// IMPORTANT: 'error' is a special EventEmitter event — emitting it with zero listeners
+// throws synchronously and used to silently kill runBatch's loop mid-batch on the very
+// first gallery-level failure (bad filename, disk I/O error, etc), with nothing written
+// anywhere explaining why the queue just stopped. This listener is what makes that a
+// normal, logged, continue-to-next-gallery event instead of a crash.
+engine.on('error', ({ galleryId, error, currentTaskNum, totalTasks }) => {
+    logActivity(`ERROR ID ${galleryId} (${currentTaskNum}/${totalTasks}): ${error}`);
+});
+
+// Queue files live next to the downloads themselves (a persistent volume) instead of a
+// path fixed at startup, so they follow the download dir if the user changes it and
+// survive a container rebuild (the app dir does not).
+function getListFile() { return path.join(engine.baseDownloadDir, 'list.txt'); }
+function getStatusFile() { return path.join(engine.baseDownloadDir, 'list_status.txt'); }
 
 const mimeTypes = {
     '.html': 'text/html',
@@ -36,10 +50,13 @@ const mimeTypes = {
 
 process.on('uncaughtException', (err) => {
     console.error('[!] Uncaught Exception in Server:', err.message);
+    logActivity(`FATAL Uncaught Exception: ${err.stack || err.message}`);
 });
 
 process.on('unhandledRejection', (reason) => {
-    console.error('[!] Unhandled Rejection in Server:', reason && reason.message ? reason.message : reason);
+    const msg = reason && reason.message ? reason.message : JSON.stringify(reason);
+    console.error('[!] Unhandled Rejection in Server:', reason);
+    logActivity(`FATAL Unhandled Rejection: ${msg}`);
 });
 
 // Batch-compress runs as a plain background job on the server process, independent of any
@@ -86,8 +103,8 @@ function startBatchCompressJob(ids, ext) {
 }
 
 function autoProcessQueue() {
-    if (fs.existsSync(LIST_FILE)) {
-        const synced = syncListTracker(LIST_FILE);
+    if (fs.existsSync(getListFile())) {
+        const synced = syncListTracker(getListFile());
         if (synced && synced.galleryIds.length > 0 && !engine.isRunning) {
             console.log(`[+] Auto-processing queue: ${synced.galleryIds.length} galleries found.`);
             engine.runBatch(synced.galleryIds, synced.trackerFile);
@@ -205,9 +222,9 @@ const server = http.createServer((req, res) => {
         }
 
         if (req.method === 'GET' && req.url === '/api/status') {
-            let listContent = fs.existsSync(LIST_FILE) ? fs.readFileSync(LIST_FILE, 'utf-8') : '';
-            let statusContent = fs.existsSync(STATUS_FILE) ? fs.readFileSync(STATUS_FILE, 'utf-8') : '';
-            let errorContent = fs.existsSync(DEFAULT_ERROR_LOG) ? fs.readFileSync(DEFAULT_ERROR_LOG, 'utf-8') : '';
+            let listContent = fs.existsSync(getListFile()) ? fs.readFileSync(getListFile(), 'utf-8') : '';
+            let statusContent = fs.existsSync(getStatusFile()) ? fs.readFileSync(getStatusFile(), 'utf-8') : '';
+            let errorContent = fs.existsSync(trackerModule.DEFAULT_ERROR_LOG) ? fs.readFileSync(trackerModule.DEFAULT_ERROR_LOG, 'utf-8') : '';
 
             const statusLines = statusContent.split('\n').filter(l => l.trim());
             // Lines that look like "# BATCH 3" mark where a user's paste/insert began —
@@ -286,8 +303,8 @@ const server = http.createServer((req, res) => {
                 try {
                     const { text } = JSON.parse(body);
                     if (typeof text === 'string') {
-                        fs.writeFileSync(LIST_FILE, text, 'utf-8');
-                        const synced = syncListTracker(LIST_FILE);
+                        fs.writeFileSync(getListFile(), text, 'utf-8');
+                        const synced = syncListTracker(getListFile());
                         logActivity(`Queue saved: ${synced ? synced.galleryIds.length : 0} gallery line(s) in list.txt`);
                         res.end(JSON.stringify({ success: true }));
 
@@ -335,8 +352,8 @@ const server = http.createServer((req, res) => {
                         engine.resume();
                         autoProcessQueue();
                     } else if (action === 'restart') {
-                        if (fs.existsSync(LIST_FILE)) {
-                            const synced = syncListTracker(LIST_FILE);
+                        if (fs.existsSync(getListFile())) {
+                            const synced = syncListTracker(getListFile());
                             if (synced && synced.galleryIds.length > 0) {
                                 engine.restart(synced.galleryIds, synced.trackerFile);
                             }
@@ -429,7 +446,7 @@ const server = http.createServer((req, res) => {
                         res.writeHead(400);
                         return res.end(JSON.stringify({ success: false, error: 'id and newName are required' }));
                     }
-                    const result = renameLibraryEntry(id.toString(), newName, undefined, LIST_FILE);
+                    const result = renameLibraryEntry(id.toString(), newName, undefined, getListFile());
                     if (result.success) logActivity(`Renamed ID ${id} -> "${newName}"`);
                     if (!result.success) res.writeHead(400);
                     return res.end(JSON.stringify(result));
@@ -519,7 +536,7 @@ const server = http.createServer((req, res) => {
                     engine.triggerForceRetry();
 
                     if (galleryId) {
-                        updateListStatus(STATUS_FILE, galleryId, 'PENDING');
+                        updateListStatus(getStatusFile(), galleryId, 'PENDING');
                         autoProcessQueue();
                     }
                     return res.end(JSON.stringify({ success: true, message: 'Force retry triggered' }));

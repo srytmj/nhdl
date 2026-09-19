@@ -1,11 +1,19 @@
 const fs = require('fs');
 const path = require('path');
-const { sanitizeName } = require('./utils');
+const { sanitizeName, atomicWriteFileSync } = require('./utils');
 const { buildZip } = require('./zip');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
-const DEFAULT_LIBRARY_FILE = path.join(ROOT_DIR, 'library.json');
-const DEFAULT_ERROR_LOG = path.join(ROOT_DIR, 'error.log');
+// Live inside the active download dir (a persistent volume) instead of ROOT_DIR (the
+// container's writable layer, wiped on every image rebuild) — see setStateDir().
+let DEFAULT_LIBRARY_FILE = path.join(ROOT_DIR, 'library.json');
+let DEFAULT_ERROR_LOG = path.join(ROOT_DIR, 'error.log');
+
+function setStateDir(dir) {
+    if (!dir) return;
+    DEFAULT_LIBRARY_FILE = path.join(dir, 'library.json');
+    DEFAULT_ERROR_LOG = path.join(dir, 'error.log');
+}
 
 function loadLibrary(libFile = DEFAULT_LIBRARY_FILE) {
     if (fs.existsSync(libFile)) {
@@ -21,10 +29,11 @@ function loadLibrary(libFile = DEFAULT_LIBRARY_FILE) {
 const MARKER_FILENAME = '.nhdl-id';
 
 // Archives (.cbz/.zip) are a single file, not a folder — there's nowhere inside them to
-// drop MARKER_FILENAME the way loose-folder galleries get one, and we have no zip-editing
-// capability to inject an entry into an already-built archive. So archives get a sidecar
-// marker file next to them instead: "Title.cbz" -> "Title.cbz.nhdl-id". Same purpose (let
-// rescanLibrary relink/dedupe after library.json is lost or the file gets moved).
+// drop MARKER_FILENAME the way loose-folder galleries get one, and there's no zip-editing
+// capability here to inject an entry into an already-built archive (including ones the API
+// hands back pre-built). A sidecar file next to the archive serves the same purpose:
+// "Title.cbz" -> "Title.cbz.nhdl-id" — lets rescanLibrary relink/dedupe it later even after
+// library.json is lost or the file gets moved.
 function archiveMarkerPath(archivePath) {
     return archivePath + MARKER_FILENAME;
 }
@@ -43,7 +52,7 @@ function saveToLibrary(id, title, folder, pages, ext, pageExts = {}, extra = {},
             downloadedAt: new Date().toISOString(),
             ...(extra.extraMeta ? { meta: extra.extraMeta } : {})
         };
-        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
 
         // Drop a tiny marker file carrying the gallery ID inside its own folder. If the
         // user later moves/renames the folder outside the app, rescanLibrary() can still
@@ -51,6 +60,30 @@ function saveToLibrary(id, title, folder, pages, ext, pageExts = {}, extra = {},
         try { fs.writeFileSync(path.join(folder, MARKER_FILENAME), id.toString(), 'utf-8'); } catch (e) {}
     } catch (e) {
         console.error("Failed to save to library.json:", e.message);
+    }
+}
+
+// Registers an already-compressed .cbz/.zip found on disk (e.g. adopted from a leftover
+// archive with no library.json entry) as a completed download.
+function saveArchivedToLibrary(id, title, archivePath, archiveExt, extra = {}, libFile = DEFAULT_LIBRARY_FILE) {
+    try {
+        const library = loadLibrary(libFile);
+        library[id] = {
+            title,
+            folder: archivePath,
+            pages: extra.pages || 0,
+            ext: null,
+            pageExts: {},
+            author: extra.author || null,
+            lang: extra.lang || null,
+            downloadedAt: new Date().toISOString(),
+            archived: true,
+            archiveExt
+        };
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
+        try { fs.writeFileSync(archiveMarkerPath(archivePath), id.toString(), 'utf-8'); } catch (e) {}
+    } catch (e) {
+        console.error("Failed to save archived entry to library.json:", e.message);
     }
 }
 
@@ -88,6 +121,26 @@ function rescanLibrary(baseDownloadDir, libFile = DEFAULT_LIBRARY_FILE) {
             continue; // gallery folders don't nest further galleries
         }
 
+        // Archive sidecars ("Title.cbz.nhdl-id") live next to the .cbz/.zip itself, one
+        // level up from where a folder marker would be — scan this dir's own files for them.
+        for (const d of dirents) {
+            if (!d.isFile() || !d.name.endsWith(MARKER_FILENAME) || d.name === MARKER_FILENAME) continue;
+            const archivePath = path.join(dir, d.name.slice(0, -MARKER_FILENAME.length));
+            if (!fs.existsSync(archivePath)) continue;
+            result.scanned++;
+            try {
+                const id = fs.readFileSync(path.join(dir, d.name), 'utf-8').trim();
+                if (id && library[id]) {
+                    if (library[id].folder !== archivePath) {
+                        library[id] = { ...library[id], folder: archivePath, legacy: false };
+                        result.relocated++;
+                    } else {
+                        result.unchanged++;
+                    }
+                }
+            } catch (e) {}
+        }
+
         if (depth < MAX_DEPTH) {
             for (const d of dirents) {
                 if (d.isDirectory()) stack.push({ dir: path.join(dir, d.name), depth: depth + 1 });
@@ -105,7 +158,7 @@ function rescanLibrary(baseDownloadDir, libFile = DEFAULT_LIBRARY_FILE) {
     for (const id of Object.keys(library)) {
         const entry = library[id];
         if (entry.folder && fs.existsSync(entry.folder)) {
-            const markerPath = path.join(entry.folder, MARKER_FILENAME);
+            const markerPath = entry.archived ? archiveMarkerPath(entry.folder) : path.join(entry.folder, MARKER_FILENAME);
             if (!fs.existsSync(markerPath)) {
                 try { fs.writeFileSync(markerPath, id.toString(), 'utf-8'); } catch (e) {}
             }
@@ -117,7 +170,7 @@ function rescanLibrary(baseDownloadDir, libFile = DEFAULT_LIBRARY_FILE) {
     }
 
     if (changed) {
-        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
     }
     return result;
 }
@@ -154,6 +207,31 @@ function buildDisplayName(title, author) {
     return title;
 }
 
+// Reverses buildDisplayName() using whatever a previous successful run already wrote into
+// list.txt (e.g. "Kazuhiro - Gal's Bitch Shijou Shugi!"). Lets processGallery check disk
+// for an already-downloaded file using a cached title WITHOUT hitting the network first —
+// the one case that matters is exactly a Cloudflare 429 blocking a fresh metadata fetch for
+// a gallery whose library.json entry was lost but whose file is still sitting on disk.
+function getCachedDisplayName(listPath, galleryId) {
+    if (!listPath || !fs.existsSync(listPath)) return null;
+    try {
+        const lines = fs.readFileSync(listPath, 'utf-8').split('\n');
+        for (const line of lines) {
+            if (line.trim().startsWith('#') || line.trim() === '') continue;
+            const m = line.match(/(?:nhentai\.net\/g\/|^)\s*(\d+)\b[^|]*\|\s*(.+)$/);
+            if (m && m[1] === galleryId.toString()) {
+                const full = m[2].trim();
+                const sepIdx = full.indexOf(' - ');
+                if (sepIdx > 0) {
+                    return { author: full.slice(0, sepIdx), title: full.slice(sepIdx + 3) };
+                }
+                return { author: null, title: full };
+            }
+        }
+    } catch (e) {}
+    return null;
+}
+
 // Rewrites the raw list.txt line for a gallery ID with a fuller display name
 // (title + artist/group), once we actually have that metadata — reuses data already
 // fetched during the normal download flow, so this never triggers an extra network request.
@@ -173,7 +251,7 @@ function updateListDisplayName(listPath, galleryId, displayName) {
             }
             return line;
         });
-        if (changed) fs.writeFileSync(listPath, updated.join('\n'), 'utf-8');
+        if (changed) atomicWriteFileSync(listPath, updated.join('\n'));
     } catch (e) {}
 }
 
@@ -186,13 +264,31 @@ function isLibraryEntryValid(entry) {
     return !!(entry && entry.folder && fs.existsSync(entry.folder));
 }
 
+// A gallery whose link is permanently unusable (404, removed, blocked page we can't parse)
+// gets marked here instead of a real download entry — isLibraryEntryValid() stays false for
+// it (there's no folder/content), but isPermanentlySkipped() lets runBatch exclude it from
+// pendingIds so it's not retried forever on every future run.
+function isPermanentlySkipped(entry) {
+    return !!(entry && entry.skipped === true);
+}
+
+function saveSkippedToLibrary(id, reason, libFile = DEFAULT_LIBRARY_FILE) {
+    try {
+        const library = loadLibrary(libFile);
+        library[id] = { skipped: true, reason, skippedAt: new Date().toISOString() };
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
+    } catch (e) {
+        console.error("Failed to save skipped entry to library.json:", e.message);
+    }
+}
+
 const MAX_ERROR_LOG_LINES = 200;
 
 function logError(galleryId, message, errorLogFile = DEFAULT_ERROR_LOG) {
+    const time = new Date().toISOString();
+    const logLine = `[${time}] ID: ${galleryId} - ${message}`;
     try {
-        const time = new Date().toISOString();
-        const logLine = `[${time}] ID: ${galleryId} - ${message}\n`;
-        fs.appendFileSync(errorLogFile, logLine, 'utf-8');
+        fs.appendFileSync(errorLogFile, logLine + '\n', 'utf-8');
 
         // Keep error.log from growing forever — trim to the most recent entries so the
         // System Faults panel doesn't pile up with stale noise.
@@ -200,9 +296,13 @@ function logError(galleryId, message, errorLogFile = DEFAULT_ERROR_LOG) {
         const lines = content.split('\n').filter(l => l.trim() !== '');
         if (lines.length > MAX_ERROR_LOG_LINES) {
             const trimmed = lines.slice(lines.length - MAX_ERROR_LOG_LINES);
-            fs.writeFileSync(errorLogFile, trimmed.join('\n') + '\n', 'utf-8');
+            atomicWriteFileSync(errorLogFile, trimmed.join('\n') + '\n');
         }
-    } catch (e) {}
+    } catch (e) {
+        // error.log itself couldn't be written (e.g. disk read-only) — fall back to
+        // stdout so `docker logs` still has the error instead of it vanishing.
+        console.error(`${logLine} [error.log write failed: ${e.code || e.message}]`);
+    }
 }
 
 function syncListTracker(listPath, libFile = DEFAULT_LIBRARY_FILE) {
@@ -284,9 +384,9 @@ function syncListTracker(listPath, libFile = DEFAULT_LIBRARY_FILE) {
         }
     });
 
-    fs.writeFileSync(trackerFile, newStatusLines.join('\n'), 'utf-8');
+    atomicWriteFileSync(trackerFile, newStatusLines.join('\n'));
     if (listChanged) {
-        fs.writeFileSync(listPath, newListLines.join('\n'), 'utf-8');
+        atomicWriteFileSync(listPath, newListLines.join('\n'));
     }
     return { galleryIds, trackerFile };
 }
@@ -307,7 +407,7 @@ function updateListStatus(trackerFile, galleryId, newStatus) {
             }
             return line;
         });
-        fs.writeFileSync(trackerFile, updatedLines.join('\n'), 'utf-8');
+        atomicWriteFileSync(trackerFile, updatedLines.join('\n'));
     } catch (e) {}
 }
 
@@ -345,7 +445,7 @@ function renameLibraryEntry(id, newTitle, libFile = DEFAULT_LIBRARY_FILE, listFi
 
     entry.title = trimmedTitle;
     library[id] = entry;
-    fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+    atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
 
     if (listFile) {
         updateListDisplayName(listFile, id, buildDisplayName(trimmedTitle, entry.author));
@@ -405,6 +505,7 @@ function compressLibraryEntry(id, options = {}, libFile = DEFAULT_LIBRARY_FILE) 
     } catch (e) {
         return { success: false, error: `Failed to write .${ext}: ` + e.message };
     }
+    try { fs.writeFileSync(archiveMarkerPath(cbzPath), id.toString(), 'utf-8'); } catch (e) {}
 
     try {
         fs.rmSync(entry.folder, { recursive: true, force: true });
@@ -416,7 +517,7 @@ function compressLibraryEntry(id, options = {}, libFile = DEFAULT_LIBRARY_FILE) 
     entry.archived = true;
     entry.archiveExt = ext;
     library[id] = entry;
-    fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+    atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
 
     return { success: true, cbzPath, pages: files.length, sizeBytes: zipBuf.length };
 }
@@ -453,22 +554,28 @@ function saveArchivedGallery(id, title, archivePath, ext, extra = {}, libFile = 
             downloadedAt: new Date().toISOString(),
             ...(extra.extraMeta ? { meta: extra.extraMeta } : {})
         };
-        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+        atomicWriteFileSync(libFile, JSON.stringify(library, null, 2));
+        try { fs.writeFileSync(archiveMarkerPath(archivePath), id.toString(), 'utf-8'); } catch (e) {}
     } catch (e) {
         console.error("Failed to save to library.json:", e.message);
     }
 }
 
 module.exports = {
-    DEFAULT_LIBRARY_FILE,
-    DEFAULT_ERROR_LOG,
+    get DEFAULT_LIBRARY_FILE() { return DEFAULT_LIBRARY_FILE; },
+    get DEFAULT_ERROR_LOG() { return DEFAULT_ERROR_LOG; },
+    setStateDir,
     loadLibrary,
     saveToLibrary,
+    saveArchivedToLibrary,
+    saveSkippedToLibrary,
     logError,
     syncListTracker,
     updateListStatus,
     isLibraryEntryValid,
+    isPermanentlySkipped,
     buildDisplayName,
+    getCachedDisplayName,
     updateListDisplayName,
     trackerFileToListPath,
     rescanLibrary,
