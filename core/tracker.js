@@ -4,8 +4,16 @@ const { sanitizeName } = require('./utils');
 const { buildZip } = require('./zip');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
-const DEFAULT_LIBRARY_FILE = path.join(ROOT_DIR, 'library.json');
-const DEFAULT_ERROR_LOG = path.join(ROOT_DIR, 'error.log');
+// Live inside the active download dir (a persistent volume) instead of ROOT_DIR (the
+// container's writable layer, wiped on every image rebuild) — see setStateDir().
+let DEFAULT_LIBRARY_FILE = path.join(ROOT_DIR, 'library.json');
+let DEFAULT_ERROR_LOG = path.join(ROOT_DIR, 'error.log');
+
+function setStateDir(dir) {
+    if (!dir) return;
+    DEFAULT_LIBRARY_FILE = path.join(dir, 'library.json');
+    DEFAULT_ERROR_LOG = path.join(dir, 'error.log');
+}
 
 function loadLibrary(libFile = DEFAULT_LIBRARY_FILE) {
     if (fs.existsSync(libFile)) {
@@ -41,6 +49,30 @@ function saveToLibrary(id, title, folder, pages, ext, pageExts = {}, extra = {},
         try { fs.writeFileSync(path.join(folder, MARKER_FILENAME), id.toString(), 'utf-8'); } catch (e) {}
     } catch (e) {
         console.error("Failed to save to library.json:", e.message);
+    }
+}
+
+// Registers an already-compressed .cbz/.zip found on disk (e.g. adopted from a leftover
+// archive with no library.json entry) as a completed download — no marker file, since a
+// zip can't hold one without unpacking it, but the archive itself is proof of completion.
+function saveArchivedToLibrary(id, title, archivePath, archiveExt, extra = {}, libFile = DEFAULT_LIBRARY_FILE) {
+    try {
+        const library = loadLibrary(libFile);
+        library[id] = {
+            title,
+            folder: archivePath,
+            pages: extra.pages || 0,
+            ext: null,
+            pageExts: {},
+            author: extra.author || null,
+            lang: extra.lang || null,
+            downloadedAt: new Date().toISOString(),
+            archived: true,
+            archiveExt
+        };
+        fs.writeFileSync(libFile, JSON.stringify(library, null, 2), 'utf-8');
+    } catch (e) {
+        console.error("Failed to save archived entry to library.json:", e.message);
     }
 }
 
@@ -179,10 +211,10 @@ function isLibraryEntryValid(entry) {
 const MAX_ERROR_LOG_LINES = 200;
 
 function logError(galleryId, message, errorLogFile = DEFAULT_ERROR_LOG) {
+    const time = new Date().toISOString();
+    const logLine = `[${time}] ID: ${galleryId} - ${message}`;
     try {
-        const time = new Date().toISOString();
-        const logLine = `[${time}] ID: ${galleryId} - ${message}\n`;
-        fs.appendFileSync(errorLogFile, logLine, 'utf-8');
+        fs.appendFileSync(errorLogFile, logLine + '\n', 'utf-8');
 
         // Keep error.log from growing forever — trim to the most recent entries so the
         // System Faults panel doesn't pile up with stale noise.
@@ -192,7 +224,11 @@ function logError(galleryId, message, errorLogFile = DEFAULT_ERROR_LOG) {
             const trimmed = lines.slice(lines.length - MAX_ERROR_LOG_LINES);
             fs.writeFileSync(errorLogFile, trimmed.join('\n') + '\n', 'utf-8');
         }
-    } catch (e) {}
+    } catch (e) {
+        // error.log itself couldn't be written (e.g. disk read-only) — fall back to
+        // stdout so `docker logs` still has the error instead of it vanishing.
+        console.error(`${logLine} [error.log write failed: ${e.code || e.message}]`);
+    }
 }
 
 function syncListTracker(listPath, libFile = DEFAULT_LIBRARY_FILE) {
@@ -412,10 +448,12 @@ function compressLibraryEntry(id, options = {}, libFile = DEFAULT_LIBRARY_FILE) 
 }
 
 module.exports = {
-    DEFAULT_LIBRARY_FILE,
-    DEFAULT_ERROR_LOG,
+    get DEFAULT_LIBRARY_FILE() { return DEFAULT_LIBRARY_FILE; },
+    get DEFAULT_ERROR_LOG() { return DEFAULT_ERROR_LOG; },
+    setStateDir,
     loadLibrary,
     saveToLibrary,
+    saveArchivedToLibrary,
     logError,
     syncListTracker,
     updateListStatus,

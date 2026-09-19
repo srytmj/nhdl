@@ -7,9 +7,9 @@ const fs = require('fs');
 const path = require('path');
 const dns = require('dns');
 
-const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, sleep } = require('./utils');
-const { loadLibrary, saveToLibrary, logError, updateListStatus, isLibraryEntryValid, buildDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery } = require('./tracker');
-const { logActivity } = require('./logger');
+const { sanitizeName, toTitleCase, getDynamicDelay, verifyImage, sleep, withFsRetryAsync } = require('./utils');
+const { loadLibrary, saveToLibrary, saveArchivedToLibrary, logError, updateListStatus, isLibraryEntryValid, buildDisplayName, updateListDisplayName, trackerFileToListPath, compressLibraryEntry, getBatchFormatForGallery, setStateDir } = require('./tracker');
+const { logActivity, setLogDir } = require('./logger');
 
 dns.setServers(['1.1.1.1', '8.8.8.8']);
 const NHENTAI_MAIN_IP = '104.26.4.188';
@@ -48,6 +48,11 @@ class DownloaderEngine extends EventEmitter {
         }
 
         this.baseDownloadDir = options.baseDownloadDir || process.env.DOWNLOAD_DIR || savedDownloadDir || path.join(__dirname, '..', 'Download');
+        // Queue/library/log state lives next to the downloads themselves (a persistent
+        // volume) instead of the app dir (container's writable layer, wiped on rebuild).
+        if (!fs.existsSync(this.baseDownloadDir)) fs.mkdirSync(this.baseDownloadDir, { recursive: true });
+        setStateDir(this.baseDownloadDir);
+        setLogDir(this.baseDownloadDir);
         this.downloadFormat = options.downloadFormat || savedDownloadFormat;
         this.autoContinueBatches = options.autoContinueBatches !== undefined ? options.autoContinueBatches : savedAutoContinue;
         this.batchSize = options.batchSize || 50;
@@ -83,6 +88,9 @@ class DownloaderEngine extends EventEmitter {
     setDownloadDir(newDir) {
         if (!newDir || typeof newDir !== 'string') return;
         this.baseDownloadDir = path.resolve(newDir);
+        if (!fs.existsSync(this.baseDownloadDir)) fs.mkdirSync(this.baseDownloadDir, { recursive: true });
+        setStateDir(this.baseDownloadDir);
+        setLogDir(this.baseDownloadDir);
         try {
             let cfg = {};
             if (fs.existsSync(CONFIG_FILE)) {
@@ -360,9 +368,63 @@ class DownloaderEngine extends EventEmitter {
             updateListDisplayName(trackerFileToListPath(trackerFile), galleryId, buildDisplayName(title, authorStr));
         }
 
-        const folderPath = path.join(this.baseDownloadDir, sanitizedLang, sanitizedAuthor, sanitizedTitle);
+        const parentDir = path.join(this.baseDownloadDir, sanitizedLang, sanitizedAuthor);
+        let folderPath = path.join(parentDir, sanitizedTitle);
+
+        // Not in library.json doesn't mean not downloaded — it may predate the marker/library
+        // feature, or the title got truncated differently than last time (folder-name length
+        // limit, a tweak on nhentai's side, etc). Before creating a fresh folder (and before
+        // downloading a single byte), check what's already sitting in the parent dir.
+        if (fs.existsSync(parentDir)) {
+            try {
+                const siblings = fs.readdirSync(parentDir, { withFileTypes: true });
+
+                // Already compressed to .cbz/.zip under this title (exact or untruncated)?
+                // That archive file IS the finished download — adopt it into library.json
+                // and stop here, no folder, no page requests, no re-download.
+                const archiveMatch = siblings.find(d => {
+                    if (!d.isFile()) return false;
+                    const m = d.name.match(/^(.*)\.(cbz|zip)$/i);
+                    return m && m[1].startsWith(sanitizedTitle);
+                });
+                if (archiveMatch) {
+                    const archiveExt = archiveMatch.name.match(/\.(cbz|zip)$/i)[1].toLowerCase();
+                    const archivePath = path.join(parentDir, archiveMatch.name);
+                    saveArchivedToLibrary(galleryId, sanitizedTitle, archivePath, archiveExt, { author: authorStr, lang: langStr, pages: numPages });
+                    if (trackerFile) {
+                        updateListStatus(trackerFile, galleryId, "SKIPPED - Already in Library");
+                        updateListDisplayName(trackerFileToListPath(trackerFile), galleryId, buildDisplayName(title, authorStr));
+                    }
+                    this.emit('skipped', { galleryId, title, currentTaskNum, totalTasks, reason: 'Already Downloaded (Archive)' });
+                    return { status: "SUCCESS", numPages, skipped: true };
+                }
+
+                // Otherwise, an existing folder with this same title (exact, or the on-disk
+                // name simply being a longer/untruncated version of it) — resume into it
+                // instead of re-downloading everything into a duplicate.
+                const folderMatch = siblings.find(d => d.isDirectory() && d.name.startsWith(sanitizedTitle));
+                if (folderMatch) folderPath = path.join(parentDir, folderMatch.name);
+            } catch (e) {}
+        }
         if (!fs.existsSync(folderPath)) {
-            fs.mkdirSync(folderPath, { recursive: true });
+            try {
+                await withFsRetryAsync(() => fs.mkdirSync(folderPath, { recursive: true }), {
+                    onRetry: (e, attempt, max) => {
+                        logActivity(`WARN ID ${galleryId}: mkdir failed (${e.code}), retry ${attempt}/${max} - ${folderPath}`);
+                    }
+                });
+            } catch (e) {
+                if (e.code === 'ENOENT' || e.code === 'ENAMETOOLONG' || e.code === 'EINVAL') {
+                    // The sanitized title still produced a path the OS rejects (odd unicode,
+                    // length, etc) — fall back to the gallery ID as the folder name instead of
+                    // killing the whole batch over one title.
+                    folderPath = path.join(parentDir, galleryId.toString());
+                    logError(galleryId, `Folder name rejected by filesystem (${e.code}), falling back to gallery ID as folder name`);
+                    fs.mkdirSync(folderPath, { recursive: true });
+                } else {
+                    throw e;
+                }
+            }
         }
 
         let completed = 0;
